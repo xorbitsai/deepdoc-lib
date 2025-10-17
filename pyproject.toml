@@ -134,7 +134,6 @@ dependencies = [
     "flask-mail>=0.10.0",
     "lark>=1.2.2",
     "torch",
-    "fastapi>=0.117.1",
 ]
 
 [project.optional-dependencies]
