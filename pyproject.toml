@@ -9,7 +9,7 @@ description = "[RAGFlow](https://ragflow.io/) is an open-source RAG (Retrieval-A
 authors = [{ name = "Zhichang Yu", email = "yuzhichang@gmail.com" }]
 license-files = ["LICENSE"]
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "datrie==0.8.2",
     "akshare>=1.15.78,<2.0.0",
