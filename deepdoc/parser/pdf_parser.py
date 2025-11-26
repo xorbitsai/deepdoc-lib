@@ -46,6 +46,102 @@ if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
 
 
+def _multiprocess_page_worker_standalone(args):
+    """独立的多进程worker函数，不依赖self实例变量（模块级别，可被pickle序列化）
+    
+    这个函数必须在模块级别定义，以便 multiprocessing 可以序列化它。
+    
+    Args:
+        args: 元组，包含 (page_idx, img_bytes_data, chars_data, zoomin_val, device_id_val, mean_height_val)
+    
+    Returns:
+        元组: (page_idx, boxes, mean_height_val, lefted_chars)
+    """
+    page_idx, img_bytes_data, chars_data, zoomin_val, device_id_val, mean_height_val = args
+    
+    # 在每个进程中重新创建 OCR 实例
+    ocr_instance = OCR()
+    
+    # 反序列化图像：从PNG字节转换为PIL Image，再转为numpy数组
+    img = Image.open(BytesIO(img_bytes_data))
+    img_np = np.array(img)
+    
+    # 执行OCR检测
+    bxs = ocr_instance.detect(img_np, device_id_val)
+    
+    # 处理检测结果
+    if not bxs:
+        return page_idx, [], mean_height_val, []
+    
+    bxs = [(line[0], line[1][0]) for line in bxs]
+    bxs = Recognizer.sort_Y_firstly(
+        [
+            {"x0": b[0][0] / zoomin_val, "x1": b[1][0] / zoomin_val, "top": b[0][1] / zoomin_val, 
+             "text": "", "txt": t, "bottom": b[-1][1] / zoomin_val, "chars": [], "page_number": page_idx + 1}
+            for b, t in bxs
+            if b[0][0] <= b[1][0] and b[0][1] <= b[-1][1]
+        ],
+        mean_height_val / 3 if mean_height_val > 0 else 8,
+    )
+    
+    # 合并chars到boxes
+    lefted_chars = []
+    for c in chars_data:
+        ii = Recognizer.find_overlapped(c, bxs)
+        if ii is None:
+            lefted_chars.append(c)
+            continue
+        ch = c["bottom"] - c["top"]
+        bh = bxs[ii]["bottom"] - bxs[ii]["top"]
+        if abs(ch - bh) / max(ch, bh) >= 0.7 and c["text"] != " ":
+            lefted_chars.append(c)
+            continue
+        bxs[ii]["chars"].append(c)
+    
+    # 处理chars，生成文本
+    for b in bxs:
+        if not b["chars"]:
+            del b["chars"]
+            continue
+        m_ht = np.mean([c["height"] for c in b["chars"]])
+        for c in Recognizer.sort_Y_firstly(b["chars"], m_ht):
+            if c["text"] == " " and b["text"]:
+                if re.match(r"[0-9a-zA-Zа-яА-Я,.?;:!%%]", b["text"][-1]):
+                    b["text"] += " "
+            else:
+                b["text"] += c["text"]
+        del b["chars"]
+    
+    # 识别没有文本的boxes
+    boxes_to_reg = []
+    for b in bxs:
+        if not b["text"]:
+            left, right, top, bott = b["x0"] * zoomin_val, b["x1"] * zoomin_val, b["top"] * zoomin_val, b["bottom"] * zoomin_val
+            b["box_image"] = ocr_instance.get_rotate_crop_image(
+                img_np, 
+                np.array([[left, top], [right, top], [right, bott], [left, bott]], dtype=np.float32)
+            )
+            boxes_to_reg.append(b)
+        del b["txt"]
+    
+    # 批量识别
+    if boxes_to_reg:
+        texts = ocr_instance.recognize_batch([b["box_image"] for b in boxes_to_reg], device_id_val)
+        for i in range(len(boxes_to_reg)):
+            boxes_to_reg[i]["text"] = texts[i]
+            del boxes_to_reg[i]["box_image"]
+    
+    # 过滤空文本的boxes
+    bxs = [b for b in bxs if b["text"]]
+    
+    # 计算mean_height
+    if mean_height_val == 0 and bxs:
+        mean_height_val = np.median([b["bottom"] - b["top"] for b in bxs])
+    
+    # 返回结果：page_idx, boxes, mean_height, lefted_chars
+    return page_idx, bxs, mean_height_val, lefted_chars
+
+
 @require_nltk_data(("tokenizers/punkt_tab", "punkt_tab"))
 class RAGFlowPdfParser:
     def __init__(self, **kwargs):
@@ -64,7 +160,18 @@ class RAGFlowPdfParser:
         self.ocr = OCR()
         self.parallel_limiter = None
         if PARALLEL_DEVICES > 1:
-            self.parallel_limiter = [trio.CapacityLimiter(1) for _ in range(PARALLEL_DEVICES)]
+            # 支持通过环境变量设置 CapacityLimiter 容量
+            use_original = os.environ.get("DEEPDOC_USE_ORIGINAL", "0").lower() in ("1", "true", "yes")
+            if use_original:
+                limiter_capacity = 1  # 原始 deepdoc 行为：capacity=1
+            else:
+                limiter_capacity = int(os.environ.get("DEEPDOC_LIMITER_CAPACITY", "2"))  # 优化：默认 capacity=2
+            self.parallel_limiter = [trio.CapacityLimiter(limiter_capacity) for _ in range(PARALLEL_DEVICES)]
+            print(f"[CONCURRENCY DEBUG] Enabled parallel processing with {PARALLEL_DEVICES} limiters, capacity={limiter_capacity} each")
+            logging.info(f"[CONCURRENCY] Enabled parallel processing with {PARALLEL_DEVICES} limiters, capacity={limiter_capacity} each")
+        else:
+            print(f"[CONCURRENCY DEBUG] Parallel processing DISABLED (PARALLEL_DEVICES={PARALLEL_DEVICES}, need > 1)")
+            logging.info(f"[CONCURRENCY] Parallel processing DISABLED (PARALLEL_DEVICES={PARALLEL_DEVICES}, need > 1)")
 
         if hasattr(self, "model_speciess"):
             self.layouter = LayoutRecognizer("layout." + self.model_speciess)
@@ -980,24 +1087,183 @@ class RAGFlowPdfParser:
                 callback(prog=(i + 1) * 0.6 / len(self.page_images), msg="")
 
         async def __img_ocr_launcher():
-            def __ocr_preprocess():
-                chars = self.page_chars[i] if not self.is_english else []
+            def __ocr_preprocess(page_idx, img):
+                chars = self.page_chars[page_idx] if not self.is_english else []
                 self.mean_height.append(np.median(sorted([c["height"] for c in chars])) if chars else 0)
                 self.mean_width.append(np.median(sorted([c["width"] for c in chars])) if chars else 8)
                 self.page_cum_height.append(img.size[1] / zoomin)
                 return chars
 
-            if self.parallel_limiter:
-                async with trio.open_nursery() as nursery:
-                    for i, img in enumerate(self.page_images):
-                        chars = __ocr_preprocess()
+            total_pages = len(self.page_images)
+            print(f"[CONCURRENCY DEBUG] Starting OCR launcher for {total_pages} pages")
+            print(f"[CONCURRENCY DEBUG] parallel_limiter = {self.parallel_limiter}")
+            print(f"[CONCURRENCY DEBUG] PARALLEL_DEVICES = {PARALLEL_DEVICES}")
 
-                        nursery.start_soon(__img_ocr, i, i % PARALLEL_DEVICES, img, chars, self.parallel_limiter[i % PARALLEL_DEVICES])
-                        await trio.sleep(0.1)
+            if self.parallel_limiter:
+                processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "default")
+                print(f"[CONCURRENCY DEBUG] Processing mode: {processing_mode}")
+
+                if processing_mode == "multiprocess":
+                    # 方案E: 多进程处理
+                    print(f"[CONCURRENCY DEBUG] Using MULTIPROCESS mode")
+                    import multiprocessing
+                    
+                    # 准备任务列表：先预处理所有页面
+                    tasks = []
+                    for i, img in enumerate(self.page_images):
+                        chars = __ocr_preprocess(i, img)
+                        
+                        # 处理chars中的空格合并逻辑（与__img_ocr中的逻辑一致）
+                        j = 0
+                        while j + 1 < len(chars):
+                            if (
+                                chars[j]["text"]
+                                and chars[j + 1]["text"]
+                                and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
+                                and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
+                            ):
+                                chars[j]["text"] += " "
+                            j += 1
+                        
+                        # 获取当前mean_height（预处理后已填充）
+                        mean_height_val = self.mean_height[i] if i < len(self.mean_height) else 0
+                        
+                        # 将图像转换为可序列化的格式（PNG字节）
+                        img_bytes = BytesIO()
+                        img.save(img_bytes, format='PNG')
+                        img_bytes_data = img_bytes.getvalue()
+                        
+                        # 计算device_id
+                        device_id_val = i % PARALLEL_DEVICES
+                        
+                        tasks.append((i, img_bytes_data, chars, zoomin, device_id_val, mean_height_val))
+                    
+                    # 使用进程池处理
+                    num_workers = min(PARALLEL_DEVICES, total_pages)
+                    print(f"[CONCURRENCY DEBUG] Starting multiprocess pool with {num_workers} workers")
+                    with multiprocessing.Pool(processes=num_workers) as pool:
+                        # 使用模块级别的函数，可以被pickle序列化
+                        results = pool.map(_multiprocess_page_worker_standalone, tasks)
+                    
+                    # 按page_idx排序结果（确保顺序正确）
+                    results.sort(key=lambda x: x[0])
+                    
+                    # 整合结果到主进程的数据结构
+                    for page_idx, boxes, mean_height_val, lefted_chars in results:
+                        # 更新mean_height（如果之前为0）
+                        if page_idx < len(self.mean_height) and self.mean_height[page_idx] == 0:
+                            self.mean_height[page_idx] = mean_height_val
+                        # 添加boxes
+                        self.boxes.append(boxes)
+                        # 合并lefted_chars到主进程
+                        self.lefted_chars.extend(lefted_chars)
+                    
+                    print(f"[CONCURRENCY DEBUG] Multiprocess completed {len(results)} pages")
+                    
+                elif processing_mode == "fixed_batch":
+                    # 方案C: 固定批处理
+                    batch_size = int(os.environ.get("DEEPDOC_BATCH_SIZE", str(PARALLEL_DEVICES * 2)))
+                    print(f"[CONCURRENCY DEBUG] Using FIXED_BATCH mode, batch_size={batch_size}")
+                    
+                    async with trio.open_nursery() as nursery:
+                        for batch_start in range(0, total_pages, batch_size):
+                            batch_end = min(batch_start + batch_size, total_pages)
+                            batch_indices = list(range(batch_start, batch_end))
+                            
+                            print(f"[CONCURRENCY DEBUG] Processing batch {batch_start//batch_size + 1}: pages {batch_start+1}-{batch_end}")
+                            
+                            async def process_batch(batch_indices):
+                                async with trio.open_nursery() as batch_nursery:
+                                    for i in batch_indices:
+                                        img = self.page_images[i]
+                                        # 使用 trio.to_thread.run_sync 包装同步预处理操作，避免阻塞事件循环
+                                        chars = await trio.to_thread.run_sync(__ocr_preprocess, i, img)
+                                        device_id = i % PARALLEL_DEVICES
+                                        batch_nursery.start_soon(__img_ocr, i, device_id, img, chars, self.parallel_limiter[device_id])
+                            
+                            await process_batch(batch_indices)
+                    
+                elif processing_mode == "sliding_batch":
+                    # 方案D: 滑动窗口批处理
+                    batch_size = int(os.environ.get("DEEPDOC_BATCH_SIZE", str(PARALLEL_DEVICES * 2)))
+                    max_concurrent_batches = int(os.environ.get("DEEPDOC_MAX_CONCURRENT_BATCHES", "2"))
+                    print(f"[CONCURRENCY DEBUG] Using SLIDING_BATCH mode, batch_size={batch_size}, max_concurrent_batches={max_concurrent_batches}")
+                    
+                    # 创建页面锁机制，确保每个页面只处理一次（包括预处理和OCR）
+                    # 为每个页面创建一个锁，避免并发时重复处理
+                    page_locks = {i: trio.Lock() for i in range(total_pages)}
+                    processed_pages = set()  # 跟踪已完全处理的页面索引（包括预处理和OCR）
+                    
+                    # 创建批处理限制器
+                    batch_limiter = trio.CapacityLimiter(max_concurrent_batches)
+                    
+                    async def process_page_safely(page_idx):
+                        """安全地处理单个页面：确保每个页面只处理一次（预处理+OCR）"""
+                        img = self.page_images[page_idx]
+                        
+                        # 使用页面锁确保每个页面只被处理一次
+                        async with page_locks[page_idx]:
+                            if page_idx not in processed_pages:
+                                # 页面尚未处理，执行完整的处理流程
+                                # 1. 预处理（使用线程池避免阻塞事件循环）
+                                chars = await trio.to_thread.run_sync(__ocr_preprocess, page_idx, img)
+                                
+                                # 2. OCR处理
+                                device_id = page_idx % PARALLEL_DEVICES
+                                await __img_ocr(page_idx, device_id, img, chars, self.parallel_limiter[device_id])
+                                
+                                # 3. 标记为已处理
+                                processed_pages.add(page_idx)
+                            # 如果页面已处理，直接跳过（不做任何操作）
+                    
+                    async def process_sliding_batch(batch_start):
+                        async with batch_limiter:
+                            batch_end = min(batch_start + batch_size, total_pages)
+                            batch_indices = list(range(batch_start, batch_end))
+                            
+                            print(f"[CONCURRENCY DEBUG] Processing sliding batch: pages {batch_start+1}-{batch_end}")
+                            
+                            # 并发处理批次中的所有页面
+                            async with trio.open_nursery() as batch_nursery:
+                                for i in batch_indices:
+                                    batch_nursery.start_soon(process_page_safely, i)
+                    
+                    async with trio.open_nursery() as nursery:
+                        for batch_start in range(0, total_pages, batch_size // 2):  # 滑动窗口，步长为 batch_size/2
+                            nursery.start_soon(process_sliding_batch, batch_start)
+                    
+                else:
+                    # 方案A/B: 默认并行模式（原始 trio 并发）
+                    print(f"[CONCURRENCY DEBUG] Using PARALLEL mode with {len(self.parallel_limiter)} limiters")
+                    concurrent_start = timer()
+                    print(f"[CONCURRENCY DEBUG] Concurrent start time: {concurrent_start:.3f}")
+                    
+                    # 对于大文档（>100页），移除调度延迟以避免累积阻塞
+                    # 小文档保留小延迟以避免内存峰值
+                    use_delay = len(self.page_images) < 100
+                    
+                    async with trio.open_nursery() as nursery:
+                        for i, img in enumerate(self.page_images):
+                            # 使用 trio.to_thread.run_sync 包装同步预处理操作，避免阻塞事件循环
+                            chars = await trio.to_thread.run_sync(__ocr_preprocess, i, img)
+                            device_id = i % PARALLEL_DEVICES
+                            print(f"[CONCURRENCY DEBUG] Scheduling page {i+1}/{total_pages} to device_id={device_id} at {timer():.3f}")
+                            nursery.start_soon(__img_ocr, i, device_id, img, chars, self.parallel_limiter[device_id])
+                            if use_delay:
+                                await trio.sleep(0.1)  # 小文档保留延迟，避免任务调度过于密集
+                    concurrent_elapsed = timer() - concurrent_start
+                    print(f"[CONCURRENCY DEBUG] All concurrent tasks completed in {concurrent_elapsed:.3f}s")
             else:
+                # 串行模式（虽然串行，但仍使用线程池避免阻塞事件循环）
+                print(f"[CONCURRENCY DEBUG] Using SEQUENTIAL mode")
+                sequential_start = timer()
+                print(f"[CONCURRENCY DEBUG] Sequential start time: {sequential_start:.3f}")
                 for i, img in enumerate(self.page_images):
-                    chars = __ocr_preprocess()
+                    chars = await trio.to_thread.run_sync(__ocr_preprocess, i, img)
+                    print(f"[CONCURRENCY DEBUG] Processing page {i+1}/{total_pages} sequentially at {timer():.3f}")
                     await __img_ocr(i, 0, img, chars, None)
+                sequential_elapsed = timer() - sequential_start
+                print(f"[CONCURRENCY DEBUG] All sequential tasks completed in {sequential_elapsed:.3f}s")
 
         start = timer()
 
