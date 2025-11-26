@@ -1390,14 +1390,15 @@ class RAGFlowPdfParser:
                     # 页面锁：确保每个页面只被 S2 处理一次
                     page_locks = [trio.Lock() for _ in range(total_pages)]
                     
-                    # 用于跟踪 S1 和 S2 完成状态
+                    # 用于跟踪 S1 完成状态（所有页面预处理完成）
                     s1_completed = trio.Event()
                     s1_pages_processed = 0
                     s1_lock = trio.Lock()
-                    
-                    s2_completed = trio.Event()
-                    s2_pages_processed = 0
-                    s2_lock = trio.Lock()
+
+                    # 用于跟踪 S2 完成状态：所有 S2 workers 结束后关闭 S2->S3 队列
+                    s2_done_event = trio.Event()
+                    s2_workers_done = 0
+                    s2_done_lock = trio.Lock()
                     
                     async def s1_preprocess_worker(worker_id: int):
                         """S1 预处理 Worker：CPU 密集型"""
@@ -1451,6 +1452,7 @@ class RAGFlowPdfParser:
                     async def s2_inference_worker(session_id: int):
                         """S2 GPU 推理 Worker：每个 session 一个 worker"""
                         processed_count = 0
+                        nonlocal s2_workers_done
                         # 计算 parallel_id：在多 session 模式下使用 session_id，在多 GPU 模式下使用 device_id
                         if pipeline_use_multi_session:
                             parallel_id = session_id  # 多 session 模式：session_id 直接作为 parallel_id
@@ -1493,15 +1495,14 @@ class RAGFlowPdfParser:
                                     # 发送到 S3 队列
                                     await queue_inferred_send.send(ocr_result)
                                     processed_count += 1
-                                    
-                                    # 更新 S2 完成计数
-                                    async with s2_lock:
-                                        s2_pages_processed += 1
-                                        if s2_pages_processed >= total_pages:
-                                            s2_completed.set()
                         except trio.EndOfChannel:
-                            pass  # 正常结束
-                        
+                            pass  # 正常结束（S1 完成后，queue_prepared 关闭，S2 自然结束）
+                        finally:
+                            async with s2_done_lock:
+                                s2_workers_done += 1
+                                if s2_workers_done >= pipeline_gpu_sessions:
+                                    s2_done_event.set()
+
                         print(f"[PIPELINE] S2 worker (session {session_id}) completed {processed_count} pages")
                     
                     async def s3_postprocess_worker(worker_id: int):
@@ -1535,21 +1536,18 @@ class RAGFlowPdfParser:
                         # 启动 S3 workers
                         for worker_id in range(S3_WORKERS):
                             nursery.start_soon(s3_postprocess_worker, worker_id)
-                    
-                    # 等待所有 S1 worker 完成
-                    await s1_completed.wait()
-                    
-                    # 关闭 S1->S2 队列的发送端，通知 S2 workers 结束
-                    await queue_prepared_send.aclose()
-                    
-                    # 等待所有 S2 worker 完成（处理完所有页面）
-                    await s2_completed.wait()
-                    
-                    # 关闭 S2->S3 队列的发送端，通知 S3 workers 结束
-                    await queue_inferred_send.aclose()
-                    
-                    # 等待所有 worker 完成（nursery 会自动等待）
-                    # 注意：这里 nursery 已经关闭，所有 worker 应该已经完成
+                        
+                        # 等待所有 S1 worker 完成
+                        await s1_completed.wait()
+                        
+                        # 关闭 S1->S2 队列的发送端，通知 S2 workers 结束
+                        await queue_prepared_send.aclose()
+                        
+                        # 等待所有 S2 worker 完成
+                        await s2_done_event.wait()
+                        
+                        # 关闭 S2->S3 队列的发送端，通知 S3 workers 结束
+                        await queue_inferred_send.aclose()
                     
                     # 对 self.boxes 进行排序，确保顺序与 page_images 一致
                     # __ocr 使用 append，所以 self.boxes 的顺序可能不是按 page_idx
