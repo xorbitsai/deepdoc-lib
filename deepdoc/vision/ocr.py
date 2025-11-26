@@ -95,13 +95,41 @@ def load_model(model_dir, nm, device_id: int | None = None, session_id: int = 0)
             model_file_path))
 
     def cuda_is_available():
+        """
+        Check if CUDA is available for ONNX Runtime.
+        Returns True only if:
+        1. ONNX Runtime has CUDAExecutionProvider available
+        2. PyTorch CUDA is available (optional, for device count check)
+        3. Device ID is valid
+        """
         try:
-            import torch
-            if device_id is not None and torch.cuda.is_available() and torch.cuda.device_count() > device_id:
-                return True
-        except Exception:
+            # First check if ONNX Runtime supports CUDA
+            available_providers = ort.get_available_providers()
+            if 'CUDAExecutionProvider' not in available_providers:
+                logging.warning(f"CUDAExecutionProvider not available in ONNX Runtime. Available providers: {available_providers}")
+                return False
+            
+            # Then check PyTorch CUDA (if available) for device count
+            try:
+                import torch
+                if device_id is not None:
+                    if not torch.cuda.is_available():
+                        logging.warning("PyTorch CUDA is not available")
+                        return False
+                    if torch.cuda.device_count() <= device_id:
+                        logging.warning(f"Device {device_id} not available. Only {torch.cuda.device_count()} GPU(s) available")
+                        return False
+            except ImportError:
+                # PyTorch not installed, but ONNX Runtime has CUDA support
+                # Assume device_id 0 is available if not specified
+                if device_id is not None and device_id > 0:
+                    logging.warning(f"PyTorch not available, cannot verify device {device_id}. Assuming device 0 is available.")
+                    return device_id == 0
+            
+            return True
+        except Exception as e:
+            logging.warning(f"Error checking CUDA availability: {e}")
             return False
-        return False
 
     options = ort.SessionOptions()
     options.enable_cpu_mem_arena = False

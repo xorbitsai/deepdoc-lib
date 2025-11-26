@@ -170,7 +170,13 @@ class RAGFlowPdfParser:
         else:
             num_parallel = PARALLEL_DEVICES
         
-        if num_parallel > 1:
+        # Check if pipeline mode is enabled
+        processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "default")
+        is_pipeline_mode = processing_mode == "pipeline"
+        
+        # For pipeline mode, allow num_parallel = 1 (single GPU single session)
+        # Pipeline mode uses queue mechanism, not CapacityLimiter for concurrency control
+        if num_parallel > 1 or (is_pipeline_mode and num_parallel >= 1):
             # 支持通过环境变量设置 CapacityLimiter 容量
             use_original = os.environ.get("DEEPDOC_USE_ORIGINAL", "0").lower() in ("1", "true", "yes")
             if use_original:
@@ -179,7 +185,10 @@ class RAGFlowPdfParser:
                 limiter_capacity = int(os.environ.get("DEEPDOC_LIMITER_CAPACITY", "2"))  # 优化：默认 capacity=2
             self.parallel_limiter = [trio.CapacityLimiter(limiter_capacity) for _ in range(num_parallel)]
             mode_str = f"multi-session ({gpu_sessions} sessions)" if use_multi_session else f"multi-GPU ({PARALLEL_DEVICES} devices)"
-            print(f"[CONCURRENCY DEBUG] Enabled parallel processing with {num_parallel} limiters ({mode_str}), capacity={limiter_capacity} each")
+            if is_pipeline_mode:
+                print(f"[CONCURRENCY DEBUG] Enabled parallel processing with {num_parallel} limiters ({mode_str}), capacity={limiter_capacity} each (pipeline mode, allows num_parallel=1)")
+            else:
+                print(f"[CONCURRENCY DEBUG] Enabled parallel processing with {num_parallel} limiters ({mode_str}), capacity={limiter_capacity} each")
             logging.info(f"[CONCURRENCY] Enabled parallel processing with {num_parallel} limiters ({mode_str}), capacity={limiter_capacity} each")
         else:
             print(f"[CONCURRENCY DEBUG] Parallel processing DISABLED (num_parallel={num_parallel}, need > 1)")
@@ -1339,18 +1348,24 @@ class RAGFlowPdfParser:
                     
                 elif processing_mode == "pipeline":
                     # 方案J: 三阶段流水线模式（CPU-GPU 协同）
-                    # 使用外层定义的 gpu_sessions 和 use_multi_session
+                    # 重新获取 gpu_sessions，确保与 OCR 初始化时一致
                     pipeline_gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
                     if pipeline_gpu_sessions <= 0:
                         pipeline_gpu_sessions = 1
                     
+                    # 在 pipeline 模式中，重新判断 use_multi_session
+                    # 如果设置了 DEEPDOC_GPU_SESSIONS > 0，即使 PARALLEL_DEVICES = 1，也认为是多 session 模式
+                    pipeline_use_multi_session = pipeline_gpu_sessions > 0 and PARALLEL_DEVICES >= 1
+                    
                     # 确保 pipeline 模式下的 session 数与 OCR 初始化时一致
-                    if use_multi_session:
+                    # 注意：在 pipeline 模式中，即使 num_parallel = 1，也应该正确处理
+                    if pipeline_use_multi_session:
                         # 多 session 模式：使用 session_id 作为 parallel_id
-                        pipeline_num_parallel = gpu_sessions
+                        pipeline_num_parallel = pipeline_gpu_sessions
                     else:
                         # 多 GPU 模式：使用 device_id 作为 parallel_id
-                        pipeline_num_parallel = num_parallel
+                        # 如果 num_parallel = 0，说明没有 GPU，使用 1 作为默认值
+                        pipeline_num_parallel = max(num_parallel, 1) if num_parallel == 0 else num_parallel
                     
                     # 配置参数
                     S1_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS", "8"))
@@ -1358,7 +1373,7 @@ class RAGFlowPdfParser:
                     QUEUE_CAPACITY = int(os.environ.get("DEEPDOC_PIPELINE_QUEUE_CAPACITY", "4"))
                     
                     print(f"[PIPELINE] Starting pipeline mode: S1_workers={S1_WORKERS}, S2_sessions={pipeline_gpu_sessions}, S3_workers={S3_WORKERS}, queue_capacity={QUEUE_CAPACITY}")
-                    print(f"[PIPELINE] use_multi_session={use_multi_session}, pipeline_num_parallel={pipeline_num_parallel}")
+                    print(f"[PIPELINE] pipeline_use_multi_session={pipeline_use_multi_session}, pipeline_num_parallel={pipeline_num_parallel}, PARALLEL_DEVICES={PARALLEL_DEVICES}")
                     
                     # 提前分配 mean_height, mean_width, page_cum_height 列表（确保线程安全）
                     self.mean_height = [0.0] * total_pages
@@ -1375,10 +1390,14 @@ class RAGFlowPdfParser:
                     # 页面锁：确保每个页面只被 S2 处理一次
                     page_locks = [trio.Lock() for _ in range(total_pages)]
                     
-                    # 用于跟踪 S1 完成状态（所有页面预处理完成）
+                    # 用于跟踪 S1 和 S2 完成状态
                     s1_completed = trio.Event()
                     s1_pages_processed = 0
                     s1_lock = trio.Lock()
+                    
+                    s2_completed = trio.Event()
+                    s2_pages_processed = 0
+                    s2_lock = trio.Lock()
                     
                     async def s1_preprocess_worker(worker_id: int):
                         """S1 预处理 Worker：CPU 密集型"""
@@ -1433,7 +1452,7 @@ class RAGFlowPdfParser:
                         """S2 GPU 推理 Worker：每个 session 一个 worker"""
                         processed_count = 0
                         # 计算 parallel_id：在多 session 模式下使用 session_id，在多 GPU 模式下使用 device_id
-                        if use_multi_session:
+                        if pipeline_use_multi_session:
                             parallel_id = session_id  # 多 session 模式：session_id 直接作为 parallel_id
                             # 验证 parallel_id 在有效范围内
                             if parallel_id >= len(self.ocr.text_detector):
@@ -1474,6 +1493,12 @@ class RAGFlowPdfParser:
                                     # 发送到 S3 队列
                                     await queue_inferred_send.send(ocr_result)
                                     processed_count += 1
+                                    
+                                    # 更新 S2 完成计数
+                                    async with s2_lock:
+                                        s2_pages_processed += 1
+                                        if s2_pages_processed >= total_pages:
+                                            s2_completed.set()
                         except trio.EndOfChannel:
                             pass  # 正常结束
                         
@@ -1514,8 +1539,13 @@ class RAGFlowPdfParser:
                     # 等待所有 S1 worker 完成
                     await s1_completed.wait()
                     
-                    # 关闭发送端，通知接收端结束
+                    # 关闭 S1->S2 队列的发送端，通知 S2 workers 结束
                     await queue_prepared_send.aclose()
+                    
+                    # 等待所有 S2 worker 完成（处理完所有页面）
+                    await s2_completed.wait()
+                    
+                    # 关闭 S2->S3 队列的发送端，通知 S3 workers 结束
                     await queue_inferred_send.aclose()
                     
                     # 等待所有 worker 完成（nursery 会自动等待）
@@ -1533,12 +1563,25 @@ class RAGFlowPdfParser:
                                 page_num = box_list[0].get("page_number", 0)
                                 if page_num > 0:
                                     page_idx = page_num - 1
-                                    boxes_by_page[page_idx] = box_list
+                                    if 0 <= page_idx < total_pages:
+                                        boxes_by_page[page_idx] = box_list
+                            elif box_list == []:
+                                # 空列表也需要处理，但我们需要知道它属于哪个页面
+                                # 由于空列表没有 page_number，我们需要通过其他方式确定
+                                # 暂时跳过，在重建时用空列表填充
+                                pass
                         
                         # 按 page_idx 顺序重建 self.boxes
                         sorted_boxes = []
                         for page_idx in range(total_pages):
                             sorted_boxes.append(boxes_by_page.get(page_idx, []))
+                        
+                        # 验证：确保所有页面都有对应的 boxes（即使是空列表）
+                        if len(sorted_boxes) != total_pages:
+                            logging.warning(f"[PIPELINE] Warning: sorted_boxes length ({len(sorted_boxes)}) != total_pages ({total_pages})")
+                            # 如果长度不匹配，补齐空列表
+                            while len(sorted_boxes) < total_pages:
+                                sorted_boxes.append([])
                         
                         self.boxes = sorted_boxes
                     
