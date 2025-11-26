@@ -159,19 +159,31 @@ class RAGFlowPdfParser:
 
         self.ocr = OCR()
         self.parallel_limiter = None
-        if PARALLEL_DEVICES > 1:
+        
+        # Check if multi-session mode is enabled (for single GPU)
+        gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+        use_multi_session = gpu_sessions > 0 and PARALLEL_DEVICES > 0
+        
+        # Determine number of parallel units (sessions or devices)
+        if use_multi_session:
+            num_parallel = gpu_sessions
+        else:
+            num_parallel = PARALLEL_DEVICES
+        
+        if num_parallel > 1:
             # 支持通过环境变量设置 CapacityLimiter 容量
             use_original = os.environ.get("DEEPDOC_USE_ORIGINAL", "0").lower() in ("1", "true", "yes")
             if use_original:
                 limiter_capacity = 1  # 原始 deepdoc 行为：capacity=1
             else:
                 limiter_capacity = int(os.environ.get("DEEPDOC_LIMITER_CAPACITY", "2"))  # 优化：默认 capacity=2
-            self.parallel_limiter = [trio.CapacityLimiter(limiter_capacity) for _ in range(PARALLEL_DEVICES)]
-            print(f"[CONCURRENCY DEBUG] Enabled parallel processing with {PARALLEL_DEVICES} limiters, capacity={limiter_capacity} each")
-            logging.info(f"[CONCURRENCY] Enabled parallel processing with {PARALLEL_DEVICES} limiters, capacity={limiter_capacity} each")
+            self.parallel_limiter = [trio.CapacityLimiter(limiter_capacity) for _ in range(num_parallel)]
+            mode_str = f"multi-session ({gpu_sessions} sessions)" if use_multi_session else f"multi-GPU ({PARALLEL_DEVICES} devices)"
+            print(f"[CONCURRENCY DEBUG] Enabled parallel processing with {num_parallel} limiters ({mode_str}), capacity={limiter_capacity} each")
+            logging.info(f"[CONCURRENCY] Enabled parallel processing with {num_parallel} limiters ({mode_str}), capacity={limiter_capacity} each")
         else:
-            print(f"[CONCURRENCY DEBUG] Parallel processing DISABLED (PARALLEL_DEVICES={PARALLEL_DEVICES}, need > 1)")
-            logging.info(f"[CONCURRENCY] Parallel processing DISABLED (PARALLEL_DEVICES={PARALLEL_DEVICES}, need > 1)")
+            print(f"[CONCURRENCY DEBUG] Parallel processing DISABLED (num_parallel={num_parallel}, need > 1)")
+            logging.info(f"[CONCURRENCY] Parallel processing DISABLED (num_parallel={num_parallel}, need > 1)")
 
         if hasattr(self, "model_speciess"):
             self.layouter = LayoutRecognizer("layout." + self.model_speciess)
@@ -1098,6 +1110,18 @@ class RAGFlowPdfParser:
             print(f"[CONCURRENCY DEBUG] Starting OCR launcher for {total_pages} pages")
             print(f"[CONCURRENCY DEBUG] parallel_limiter = {self.parallel_limiter}")
             print(f"[CONCURRENCY DEBUG] PARALLEL_DEVICES = {PARALLEL_DEVICES}")
+            
+            # Check if multi-session mode is enabled (for single GPU)
+            gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+            use_multi_session = gpu_sessions > 0 and PARALLEL_DEVICES > 0
+            if use_multi_session:
+                print(f"[CONCURRENCY DEBUG] Multi-session mode enabled: {gpu_sessions} sessions on GPU 0")
+                # In multi-session mode, use session_id as index (0 to gpu_sessions-1)
+                # All sessions use device_id=0, but have different session_id
+                num_parallel = gpu_sessions
+            else:
+                # In multi-GPU mode, use device_id as index (0 to PARALLEL_DEVICES-1)
+                num_parallel = PARALLEL_DEVICES
 
             if self.parallel_limiter:
                 processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "default")
@@ -1133,10 +1157,10 @@ class RAGFlowPdfParser:
                         img.save(img_bytes, format='PNG')
                         img_bytes_data = img_bytes.getvalue()
                         
-                        # 计算device_id
-                        device_id_val = i % PARALLEL_DEVICES
+                        # 计算parallel_id (device_id in multi-GPU mode, session_id in multi-session mode)
+                        parallel_id_val = i % num_parallel
                         
-                        tasks.append((i, img_bytes_data, chars, zoomin, device_id_val, mean_height_val))
+                        tasks.append((i, img_bytes_data, chars, zoomin, parallel_id_val, mean_height_val))
                     
                     # 使用进程池处理
                     num_workers = min(PARALLEL_DEVICES, total_pages)
@@ -1178,8 +1202,8 @@ class RAGFlowPdfParser:
                                         img = self.page_images[i]
                                         # 使用 trio.to_thread.run_sync 包装同步预处理操作，避免阻塞事件循环
                                         chars = await trio.to_thread.run_sync(__ocr_preprocess, i, img)
-                                        device_id = i % PARALLEL_DEVICES
-                                        batch_nursery.start_soon(__img_ocr, i, device_id, img, chars, self.parallel_limiter[device_id])
+                                        parallel_id = i % num_parallel
+                                        batch_nursery.start_soon(__img_ocr, i, parallel_id, img, chars, self.parallel_limiter[parallel_id])
                             
                             await process_batch(batch_indices)
                     
@@ -1209,8 +1233,8 @@ class RAGFlowPdfParser:
                                 chars = await trio.to_thread.run_sync(__ocr_preprocess, page_idx, img)
                                 
                                 # 2. OCR处理
-                                device_id = page_idx % PARALLEL_DEVICES
-                                await __img_ocr(page_idx, device_id, img, chars, self.parallel_limiter[device_id])
+                                parallel_id = page_idx % num_parallel
+                                await __img_ocr(page_idx, parallel_id, img, chars, self.parallel_limiter[parallel_id])
                                 
                                 # 3. 标记为已处理
                                 processed_pages.add(page_idx)
@@ -1232,6 +1256,128 @@ class RAGFlowPdfParser:
                         for batch_start in range(0, total_pages, batch_size // 2):  # 滑动窗口，步长为 batch_size/2
                             nursery.start_soon(process_sliding_batch, batch_start)
                     
+                elif processing_mode == "optimized_batch_serial":
+                    # 方案H: 优化批处理 - 批次内串行
+                    BATCH_SIZE = int(os.environ.get("DEEPDOC_BATCH_SIZE", "16"))
+                    print(f"[CONCURRENCY DEBUG] Using OPTIMIZED_BATCH_SERIAL mode, batch_size={BATCH_SIZE}")
+                    
+                    # 先预处理所有页面（串行执行，确保顺序正确）
+                    print(f"[CONCURRENCY DEBUG] Preprocessing all {total_pages} pages...")
+                    preprocessed_chars = {}
+                    for i, img in enumerate(self.page_images):
+                        chars = __ocr_preprocess(i, img)
+                        preprocessed_chars[i] = chars
+                    print(f"[CONCURRENCY DEBUG] Preprocessing completed for all pages")
+                    
+                    def process_batch_sync(batch_indices):
+                        """在线程池中一次性处理一批：OCR（批次内串行）"""
+                        for i in batch_indices:
+                            img = self.page_images[i]
+                            chars = preprocessed_chars[i]  # 使用预处理好的chars
+                            
+                            # 字符合并逻辑（与 __img_ocr 中的逻辑一致）
+                            j = 0
+                            while j + 1 < len(chars):
+                                if (
+                                    chars[j]["text"]
+                                    and chars[j + 1]["text"]
+                                    and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
+                                    and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
+                                ):
+                                    chars[j]["text"] += " "
+                                j += 1
+                            
+                            # 执行 OCR（核心计算）
+                            # In multi-session mode, use session_id as index; otherwise use device_id
+                            parallel_id = i % num_parallel
+                            self.__ocr(i + 1, img, chars, zoomin, parallel_id)
+                    
+                    async def run_batch_task(batch_indices, limiter):
+                        """异步包装器：将批次任务提交到线程池"""
+                        async with limiter:
+                            await trio.to_thread.run_sync(process_batch_sync, batch_indices)
+                    
+                    # 主调度循环（极速分发模式）
+                    print(f"[CONCURRENCY DEBUG] Starting optimized batch processing. Total: {total_pages}, Batch: {BATCH_SIZE}")
+                    concurrent_start = timer()
+                    
+                    async with trio.open_nursery() as nursery:
+                        # 按批次切分任务，快速分发所有批次
+                        for start_idx in range(0, total_pages, BATCH_SIZE):
+                            end_idx = min(start_idx + BATCH_SIZE, total_pages)
+                            batch_indices = list(range(start_idx, end_idx))
+                            
+                            # 负载均衡：根据批次号分配 Limiter
+                            limiter = self.parallel_limiter[start_idx % num_parallel]
+                            
+                            # 非阻塞分发：瞬间完成所有批次的任务投递
+                            nursery.start_soon(run_batch_task, batch_indices, limiter)
+                    
+                    concurrent_elapsed = timer() - concurrent_start
+                    print(f"[CONCURRENCY DEBUG] All optimized batch tasks completed in {concurrent_elapsed:.3f}s")
+                    
+                elif processing_mode == "optimized_batch_parallel":
+                    # 方案I: 优化批处理 - 批次内并行
+                    BATCH_SIZE = int(os.environ.get("DEEPDOC_BATCH_SIZE", "16"))
+                    print(f"[CONCURRENCY DEBUG] Using OPTIMIZED_BATCH_PARALLEL mode, batch_size={BATCH_SIZE}")
+                    
+                    # 先预处理所有页面（串行执行，确保顺序正确）
+                    print(f"[CONCURRENCY DEBUG] Preprocessing all {total_pages} pages...")
+                    preprocessed_chars = {}
+                    for i, img in enumerate(self.page_images):
+                        chars = __ocr_preprocess(i, img)
+                        preprocessed_chars[i] = chars
+                    print(f"[CONCURRENCY DEBUG] Preprocessing completed for all pages")
+                    
+                    async def process_batch_parallel(batch_indices, limiter):
+                        """批次内并行处理：OCR"""
+                        async with trio.open_nursery() as batch_nursery:
+                            for i in batch_indices:
+                                img = self.page_images[i]
+                                chars = preprocessed_chars[i]  # 使用预处理好的chars
+                                
+                                # 字符合并逻辑
+                                j = 0
+                                while j + 1 < len(chars):
+                                    if (
+                                        chars[j]["text"]
+                                        and chars[j + 1]["text"]
+                                        and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
+                                        and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
+                                    ):
+                                        chars[j]["text"] += " "
+                                    j += 1
+                                
+                                # OCR 处理（在线程池中，受 limiter 控制）
+                                parallel_id = i % num_parallel
+                                async with limiter:
+                                    await trio.to_thread.run_sync(lambda: self.__ocr(i + 1, img, chars, zoomin, parallel_id))
+                    
+                    async def run_batch_task_parallel(batch_indices, batch_limiter):
+                        """批次任务包装器"""
+                        async with batch_limiter:
+                            await process_batch_parallel(batch_indices, self.parallel_limiter[0])  # 使用第一个 limiter
+                    
+                    # 主调度循环（极速分发模式）
+                    print(f"[CONCURRENCY DEBUG] Starting optimized batch parallel processing. Total: {total_pages}, Batch: {BATCH_SIZE}")
+                    concurrent_start = timer()
+                    
+                    # 批次级别的并发控制
+                    max_concurrent_batches = PARALLEL_DEVICES
+                    batch_limiter = trio.CapacityLimiter(max_concurrent_batches)
+                    
+                    async with trio.open_nursery() as nursery:
+                        # 按批次切分任务，快速分发所有批次
+                        for start_idx in range(0, total_pages, BATCH_SIZE):
+                            end_idx = min(start_idx + BATCH_SIZE, total_pages)
+                            batch_indices = list(range(start_idx, end_idx))
+                            
+                            # 非阻塞分发：瞬间完成所有批次的任务投递
+                            nursery.start_soon(run_batch_task_parallel, batch_indices, batch_limiter)
+                    
+                    concurrent_elapsed = timer() - concurrent_start
+                    print(f"[CONCURRENCY DEBUG] All optimized batch parallel tasks completed in {concurrent_elapsed:.3f}s")
+                    
                 else:
                     # 方案A/B: 默认并行模式（原始 trio 并发）
                     print(f"[CONCURRENCY DEBUG] Using PARALLEL mode with {len(self.parallel_limiter)} limiters")
@@ -1246,9 +1392,9 @@ class RAGFlowPdfParser:
                         for i, img in enumerate(self.page_images):
                             # 使用 trio.to_thread.run_sync 包装同步预处理操作，避免阻塞事件循环
                             chars = await trio.to_thread.run_sync(__ocr_preprocess, i, img)
-                            device_id = i % PARALLEL_DEVICES
-                            print(f"[CONCURRENCY DEBUG] Scheduling page {i+1}/{total_pages} to device_id={device_id} at {timer():.3f}")
-                            nursery.start_soon(__img_ocr, i, device_id, img, chars, self.parallel_limiter[device_id])
+                            parallel_id = i % num_parallel
+                            print(f"[CONCURRENCY DEBUG] Scheduling page {i+1}/{total_pages} to parallel_id={parallel_id} at {timer():.3f}")
+                            nursery.start_soon(__img_ocr, i, parallel_id, img, chars, self.parallel_limiter[parallel_id])
                             if use_delay:
                                 await trio.sleep(0.1)  # 小文档保留延迟，避免任务调度过于密集
                     concurrent_elapsed = timer() - concurrent_start

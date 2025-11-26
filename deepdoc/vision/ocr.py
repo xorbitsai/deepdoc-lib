@@ -67,14 +67,27 @@ def create_operators(op_param_list, global_config=None):
     return ops
 
 
-def load_model(model_dir, nm, device_id: int | None = None):
+def load_model(model_dir, nm, device_id: int | None = None, session_id: int = 0):
+    """
+    Load ONNX model with support for multi-session on single GPU.
+    
+    Args:
+        model_dir: Directory containing the model file
+        nm: Model name (without .onnx extension)
+        device_id: GPU device ID (None for CPU, 0 for first GPU, etc.)
+        session_id: Session ID for multi-session support on same GPU (default: 0)
+    """
     model_file_path = os.path.join(model_dir, nm + ".onnx")
-    model_cached_tag = model_file_path + str(device_id) if device_id is not None else model_file_path
+    # Include both device_id and session_id in cache key to support multi-session
+    if device_id is not None:
+        model_cached_tag = f"{model_file_path}_{device_id}_{session_id}"
+    else:
+        model_cached_tag = f"{model_file_path}_cpu_{session_id}"
 
     global loaded_models
     loaded_model = loaded_models.get(model_cached_tag)
     if loaded_model:
-        logging.info(f"load_model {model_file_path} reuses cached model")
+        logging.info(f"load_model {model_file_path} reuses cached model (device_id={device_id}, session_id={session_id})")
         return loaded_model
 
     if not os.path.exists(model_file_path):
@@ -84,7 +97,7 @@ def load_model(model_dir, nm, device_id: int | None = None):
     def cuda_is_available():
         try:
             import torch
-            if torch.cuda.is_available() and torch.cuda.device_count() > device_id:
+            if device_id is not None and torch.cuda.is_available() and torch.cuda.device_count() > device_id:
                 return True
         except Exception:
             return False
@@ -99,10 +112,15 @@ def load_model(model_dir, nm, device_id: int | None = None):
     # https://github.com/microsoft/onnxruntime/issues/9509#issuecomment-951546580
     # Shrink GPU memory after execution
     run_options = ort.RunOptions()
+    
+    # Get GPU memory limit per session (default: 4GB, can be overridden)
+    gpu_mem_limit_mb = int(os.environ.get("DEEPDOC_GPU_MEM_LIMIT_MB", "4096"))
+    gpu_mem_limit = gpu_mem_limit_mb * 1024 * 1024
+    
     if cuda_is_available():
         cuda_provider_options = {
             "device_id": device_id, # Use specific GPU
-            "gpu_mem_limit": 4 * 1024 * 1024 * 1024, # Limit gpu memory
+            "gpu_mem_limit": gpu_mem_limit, # Limit gpu memory per session
             "arena_extend_strategy": "kNextPowerOfTwo",  # gpu memory allocation strategy
         }
         sess = ort.InferenceSession(
@@ -112,21 +130,21 @@ def load_model(model_dir, nm, device_id: int | None = None):
             provider_options=[cuda_provider_options]
             )
         run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:" + str(device_id))
-        logging.info(f"load_model {model_file_path} uses GPU")
+        logging.info(f"load_model {model_file_path} uses GPU (device_id={device_id}, session_id={session_id}, mem_limit={gpu_mem_limit_mb}MB)")
     else:
         sess = ort.InferenceSession(
             model_file_path,
             options=options,
             providers=['CPUExecutionProvider'])
         run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu")
-        logging.info(f"load_model {model_file_path} uses CPU")
+        logging.info(f"load_model {model_file_path} uses CPU (session_id={session_id})")
     loaded_model = (sess, run_options)
     loaded_models[model_cached_tag] = loaded_model
     return loaded_model
 
 
 class TextRecognizer:
-    def __init__(self, model_dir, device_id: int | None = None):
+    def __init__(self, model_dir, device_id: int | None = None, session_id: int = 0):
         self.rec_image_shape = [int(v) for v in "3, 48, 320".split(",")]
         self.rec_batch_num = 16
         postprocess_params = {
@@ -135,7 +153,7 @@ class TextRecognizer:
             "use_space_char": True
         }
         self.postprocess_op = build_post_process(postprocess_params)
-        self.predictor, self.run_options = load_model(model_dir, 'rec', device_id)
+        self.predictor, self.run_options = load_model(model_dir, 'rec', device_id, session_id)
         self.input_tensor = self.predictor.get_inputs()[0]
 
     def resize_norm_img(self, img, max_wh_ratio):
@@ -397,7 +415,7 @@ class TextRecognizer:
 
 
 class TextDetector:
-    def __init__(self, model_dir, device_id: int | None = None):
+    def __init__(self, model_dir, device_id: int | None = None, session_id: int = 0):
         pre_process_list = [{
             'DetResizeForTest': {
                 'limit_side_len': 960,
@@ -421,7 +439,7 @@ class TextDetector:
                               "unclip_ratio": 1.5, "use_dilation": False, "score_mode": "fast", "box_type": "quad"}
 
         self.postprocess_op = build_post_process(postprocess_params)
-        self.predictor, self.run_options = load_model(model_dir, 'det', device_id)
+        self.predictor, self.run_options = load_model(model_dir, 'det', device_id, session_id)
         self.input_tensor = self.predictor.get_inputs()[0]
 
         img_h, img_w = self.input_tensor.shape[2:]
@@ -533,13 +551,26 @@ class OCR:
                 det_model_path = os.path.join(model_dir, "det.onnx")
                 print("det.onnx 是否存在：", os.path.exists(det_model_path))
 
-                # Append muti-gpus task to the list
+                # Support multi-GPU or multi-session on single GPU
+                # Check if multi-session mode is enabled (for single GPU)
+                gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+                
                 if PARALLEL_DEVICES > 0:
-                    self.text_detector = []
-                    self.text_recognizer = []
-                    for device_id in range(PARALLEL_DEVICES):
-                        self.text_detector.append(TextDetector(model_dir, device_id))
-                        self.text_recognizer.append(TextRecognizer(model_dir, device_id))
+                    if gpu_sessions > 0:
+                        # Multi-session mode: create multiple sessions on single GPU (device_id=0)
+                        print(f"[OCR INIT] Using multi-session mode: {gpu_sessions} sessions on GPU 0")
+                        self.text_detector = []
+                        self.text_recognizer = []
+                        for session_id in range(gpu_sessions):
+                            self.text_detector.append(TextDetector(model_dir, device_id=0, session_id=session_id))
+                            self.text_recognizer.append(TextRecognizer(model_dir, device_id=0, session_id=session_id))
+                    else:
+                        # Multi-GPU mode: create one session per GPU
+                        self.text_detector = []
+                        self.text_recognizer = []
+                        for device_id in range(PARALLEL_DEVICES):
+                            self.text_detector.append(TextDetector(model_dir, device_id))
+                            self.text_recognizer.append(TextRecognizer(model_dir, device_id))
                 else:
                     self.text_detector = [TextDetector(model_dir)]
                     self.text_recognizer = [TextRecognizer(model_dir)]
@@ -549,12 +580,25 @@ class OCR:
                                               local_dir=os.path.join(get_project_base_directory(), "dict/ocr"),
                                               local_dir_use_symlinks=False)
                 
+                # Support multi-GPU or multi-session on single GPU
+                gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+                
                 if PARALLEL_DEVICES > 0:
-                    self.text_detector = []
-                    self.text_recognizer = []
-                    for device_id in range(PARALLEL_DEVICES):
-                        self.text_detector.append(TextDetector(model_dir, device_id))
-                        self.text_recognizer.append(TextRecognizer(model_dir, device_id))
+                    if gpu_sessions > 0:
+                        # Multi-session mode: create multiple sessions on single GPU (device_id=0)
+                        print(f"[OCR INIT] Using multi-session mode: {gpu_sessions} sessions on GPU 0")
+                        self.text_detector = []
+                        self.text_recognizer = []
+                        for session_id in range(gpu_sessions):
+                            self.text_detector.append(TextDetector(model_dir, device_id=0, session_id=session_id))
+                            self.text_recognizer.append(TextRecognizer(model_dir, device_id=0, session_id=session_id))
+                    else:
+                        # Multi-GPU mode: create one session per GPU
+                        self.text_detector = []
+                        self.text_recognizer = []
+                        for device_id in range(PARALLEL_DEVICES):
+                            self.text_detector.append(TextDetector(model_dir, device_id))
+                            self.text_recognizer.append(TextRecognizer(model_dir, device_id))
                 else:
                     self.text_detector = [TextDetector(model_dir)]
                     self.text_recognizer = [TextRecognizer(model_dir)]
