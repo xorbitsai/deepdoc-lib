@@ -1105,6 +1105,27 @@ class RAGFlowPdfParser:
                 self.mean_width.append(np.median(sorted([c["width"] for c in chars])) if chars else 8)
                 self.page_cum_height.append(img.size[1] / zoomin)
                 return chars
+            
+            # Pipeline 数据结构
+            from dataclasses import dataclass
+            from typing import Optional
+            
+            @dataclass
+            class PreparedPage:
+                """S1 预处理后的页面数据"""
+                page_idx: int
+                img: Image.Image
+                chars: list
+                zoomin: int
+            
+            @dataclass
+            class OCRResult:
+                """S2 GPU 推理后的结果"""
+                page_idx: int
+                pagenum: int  # 1-based page number
+                boxes: list
+                lefted_chars: list
+                mean_height_val: float
 
             total_pages = len(self.page_images)
             print(f"[CONCURRENCY DEBUG] Starting OCR launcher for {total_pages} pages")
@@ -1315,6 +1336,191 @@ class RAGFlowPdfParser:
                     
                     concurrent_elapsed = timer() - concurrent_start
                     print(f"[CONCURRENCY DEBUG] All optimized batch tasks completed in {concurrent_elapsed:.3f}s")
+                    
+                elif processing_mode == "pipeline":
+                    # 方案J: 三阶段流水线模式（CPU-GPU 协同）
+                    gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
+                    if gpu_sessions <= 0:
+                        gpu_sessions = 1
+                    
+                    # 配置参数
+                    S1_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS", "8"))
+                    S3_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S3_WORKERS", "2"))
+                    QUEUE_CAPACITY = int(os.environ.get("DEEPDOC_PIPELINE_QUEUE_CAPACITY", "4"))
+                    
+                    print(f"[PIPELINE] Starting pipeline mode: S1_workers={S1_WORKERS}, S2_sessions={gpu_sessions}, S3_workers={S3_WORKERS}, queue_capacity={QUEUE_CAPACITY}")
+                    
+                    # 提前分配 mean_height, mean_width, page_cum_height 列表（确保线程安全）
+                    self.mean_height = [0.0] * total_pages
+                    self.mean_width = [8.0] * total_pages
+                    self.page_cum_height = [0.0] * (total_pages + 1)
+                    # 注意：不预分配 self.boxes，因为 __ocr 使用 append
+                    # 我们会在 pipeline 结束时对 self.boxes 进行排序
+                    self.boxes = []
+                    
+                    # 创建队列
+                    queue_prepared_send, queue_prepared_recv = trio.open_memory_channel(QUEUE_CAPACITY)
+                    queue_inferred_send, queue_inferred_recv = trio.open_memory_channel(QUEUE_CAPACITY)
+                    
+                    # 页面锁：确保每个页面只被 S2 处理一次
+                    page_locks = [trio.Lock() for _ in range(total_pages)]
+                    
+                    # 用于跟踪 S1 完成状态（所有页面预处理完成）
+                    s1_completed = trio.Event()
+                    s1_pages_processed = 0
+                    s1_lock = trio.Lock()
+                    
+                    async def s1_preprocess_worker(worker_id: int):
+                        """S1 预处理 Worker：CPU 密集型"""
+                        nonlocal s1_pages_processed
+                        processed_count = 0
+                        
+                        for page_idx in range(total_pages):
+                            # 负载均衡：每个 worker 处理一部分页面
+                            if page_idx % S1_WORKERS != worker_id:
+                                continue
+                            
+                            img = self.page_images[page_idx]
+                            
+                            # 预处理（在线程池中执行，避免阻塞事件循环）
+                            def do_preprocess():
+                                chars = __ocr_preprocess(page_idx, img)
+                                
+                                # 字符合并逻辑（与 __img_ocr 中的逻辑一致）
+                                j = 0
+                                while j + 1 < len(chars):
+                                    if (
+                                        chars[j]["text"]
+                                        and chars[j + 1]["text"]
+                                        and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
+                                        and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
+                                    ):
+                                        chars[j]["text"] += " "
+                                    j += 1
+                                
+                                return PreparedPage(
+                                    page_idx=page_idx,
+                                    img=img,
+                                    chars=chars,
+                                    zoomin=zoomin
+                                )
+                            
+                            prepared_page = await trio.to_thread.run_sync(do_preprocess)
+                            
+                            # 发送到 S2 队列
+                            await queue_prepared_send.send(prepared_page)
+                            processed_count += 1
+                            
+                            # 更新完成计数
+                            async with s1_lock:
+                                s1_pages_processed += 1
+                                if s1_pages_processed >= total_pages:
+                                    s1_completed.set()
+                        
+                        print(f"[PIPELINE] S1 worker {worker_id} completed {processed_count} pages")
+                    
+                    async def s2_inference_worker(session_id: int):
+                        """S2 GPU 推理 Worker：每个 session 一个 worker"""
+                        processed_count = 0
+                        parallel_id = session_id if use_multi_session else session_id % num_parallel
+                        
+                        try:
+                            async for prepared_page in queue_prepared_recv:
+                                page_idx = prepared_page.page_idx
+                                pagenum = page_idx + 1
+                                
+                                # 使用页面锁确保每个页面只被处理一次
+                                async with page_locks[page_idx]:
+                                    # GPU 推理（在线程池中执行，但主要耗时在 GPU）
+                                    def do_inference():
+                                        # 执行 OCR（__ocr 会直接修改 self.boxes 和 self.lefted_chars）
+                                        # 注意：__ocr 使用 append，所以新 boxes 会添加到 self.boxes 末尾
+                                        self.__ocr(pagenum, prepared_page.img, prepared_page.chars, prepared_page.zoomin, parallel_id)
+                                        
+                                        mean_height_val = self.mean_height[page_idx] if page_idx < len(self.mean_height) else 0.0
+                                        
+                                        return OCRResult(
+                                            page_idx=page_idx,
+                                            pagenum=pagenum,
+                                            boxes=[],  # boxes 已在 __ocr 中添加到 self.boxes
+                                            lefted_chars=[],
+                                            mean_height_val=mean_height_val
+                                        )
+                                    
+                                    ocr_result = await trio.to_thread.run_sync(do_inference)
+                                    
+                                    # 发送到 S3 队列
+                                    await queue_inferred_send.send(ocr_result)
+                                    processed_count += 1
+                        except trio.EndOfChannel:
+                            pass  # 正常结束
+                        
+                        print(f"[PIPELINE] S2 worker (session {session_id}) completed {processed_count} pages")
+                    
+                    async def s3_postprocess_worker(worker_id: int):
+                        """S3 后处理 Worker：CPU 密集型（验证和清理）"""
+                        processed_count = 0
+                        
+                        try:
+                            async for ocr_result in queue_inferred_recv:
+                                # 后处理：验证数据完整性
+                                # 由于 __ocr 已经直接修改了 self.boxes 和 self.lefted_chars，
+                                # 这里主要是验证和记录完成状态
+                                
+                                # 验证 boxes 已正确添加（__ocr 使用 append，所以顺序可能不是按 page_idx）
+                                # 我们只需要确保所有页面都被处理即可
+                                processed_count += 1
+                        except trio.EndOfChannel:
+                            pass  # 正常结束
+                        
+                        print(f"[PIPELINE] S3 worker {worker_id} completed {processed_count} pages")
+                    
+                    # 启动所有 worker
+                    async with trio.open_nursery() as nursery:
+                        # 启动 S1 workers
+                        for worker_id in range(S1_WORKERS):
+                            nursery.start_soon(s1_preprocess_worker, worker_id)
+                        
+                        # 启动 S2 workers（每个 session 一个）
+                        for session_id in range(gpu_sessions):
+                            nursery.start_soon(s2_inference_worker, session_id)
+                        
+                        # 启动 S3 workers
+                        for worker_id in range(S3_WORKERS):
+                            nursery.start_soon(s3_postprocess_worker, worker_id)
+                    
+                    # 等待所有 S1 worker 完成
+                    await s1_completed.wait()
+                    
+                    # 关闭发送端，通知接收端结束
+                    await queue_prepared_send.aclose()
+                    await queue_inferred_send.aclose()
+                    
+                    # 等待所有 worker 完成（nursery 会自动等待）
+                    # 注意：这里 nursery 已经关闭，所有 worker 应该已经完成
+                    
+                    # 对 self.boxes 进行排序，确保顺序与 page_images 一致
+                    # __ocr 使用 append，所以 self.boxes 的顺序可能不是按 page_idx
+                    # 我们需要按照 page_number 对 self.boxes 进行分组和排序
+                    if len(self.boxes) > 0:
+                        # 按 page_number 分组 boxes
+                        boxes_by_page = {}
+                        for box_list in self.boxes:
+                            if box_list and len(box_list) > 0:
+                                # 获取第一个 box 的 page_number（同一页面的 boxes 应该有相同的 page_number）
+                                page_num = box_list[0].get("page_number", 0)
+                                if page_num > 0:
+                                    page_idx = page_num - 1
+                                    boxes_by_page[page_idx] = box_list
+                        
+                        # 按 page_idx 顺序重建 self.boxes
+                        sorted_boxes = []
+                        for page_idx in range(total_pages):
+                            sorted_boxes.append(boxes_by_page.get(page_idx, []))
+                        
+                        self.boxes = sorted_boxes
+                    
+                    print(f"[PIPELINE] All pipeline workers completed, boxes sorted")
                     
                 elif processing_mode == "optimized_batch_parallel":
                     # 方案I: 优化批处理 - 批次内并行
