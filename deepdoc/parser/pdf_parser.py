@@ -1339,16 +1339,26 @@ class RAGFlowPdfParser:
                     
                 elif processing_mode == "pipeline":
                     # 方案J: 三阶段流水线模式（CPU-GPU 协同）
-                    gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
-                    if gpu_sessions <= 0:
-                        gpu_sessions = 1
+                    # 使用外层定义的 gpu_sessions 和 use_multi_session
+                    pipeline_gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
+                    if pipeline_gpu_sessions <= 0:
+                        pipeline_gpu_sessions = 1
+                    
+                    # 确保 pipeline 模式下的 session 数与 OCR 初始化时一致
+                    if use_multi_session:
+                        # 多 session 模式：使用 session_id 作为 parallel_id
+                        pipeline_num_parallel = gpu_sessions
+                    else:
+                        # 多 GPU 模式：使用 device_id 作为 parallel_id
+                        pipeline_num_parallel = num_parallel
                     
                     # 配置参数
                     S1_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS", "8"))
                     S3_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S3_WORKERS", "2"))
                     QUEUE_CAPACITY = int(os.environ.get("DEEPDOC_PIPELINE_QUEUE_CAPACITY", "4"))
                     
-                    print(f"[PIPELINE] Starting pipeline mode: S1_workers={S1_WORKERS}, S2_sessions={gpu_sessions}, S3_workers={S3_WORKERS}, queue_capacity={QUEUE_CAPACITY}")
+                    print(f"[PIPELINE] Starting pipeline mode: S1_workers={S1_WORKERS}, S2_sessions={pipeline_gpu_sessions}, S3_workers={S3_WORKERS}, queue_capacity={QUEUE_CAPACITY}")
+                    print(f"[PIPELINE] use_multi_session={use_multi_session}, pipeline_num_parallel={pipeline_num_parallel}")
                     
                     # 提前分配 mean_height, mean_width, page_cum_height 列表（确保线程安全）
                     self.mean_height = [0.0] * total_pages
@@ -1422,7 +1432,19 @@ class RAGFlowPdfParser:
                     async def s2_inference_worker(session_id: int):
                         """S2 GPU 推理 Worker：每个 session 一个 worker"""
                         processed_count = 0
-                        parallel_id = session_id if use_multi_session else session_id % num_parallel
+                        # 计算 parallel_id：在多 session 模式下使用 session_id，在多 GPU 模式下使用 device_id
+                        if use_multi_session:
+                            parallel_id = session_id  # 多 session 模式：session_id 直接作为 parallel_id
+                            # 验证 parallel_id 在有效范围内
+                            if parallel_id >= len(self.ocr.text_detector):
+                                raise ValueError(f"parallel_id {parallel_id} out of range (max: {len(self.ocr.text_detector) - 1})")
+                        else:
+                            parallel_id = session_id % pipeline_num_parallel  # 多 GPU 模式：使用 device_id
+                            # 验证 parallel_id 在有效范围内
+                            if parallel_id >= len(self.ocr.text_detector):
+                                raise ValueError(f"parallel_id {parallel_id} out of range (max: {len(self.ocr.text_detector) - 1})")
+                        
+                        print(f"[PIPELINE] S2 worker {session_id} started with parallel_id={parallel_id} (detector_count={len(self.ocr.text_detector)}, recognizer_count={len(self.ocr.text_recognizer)})")
                         
                         try:
                             async for prepared_page in queue_prepared_recv:
@@ -1482,7 +1504,7 @@ class RAGFlowPdfParser:
                             nursery.start_soon(s1_preprocess_worker, worker_id)
                         
                         # 启动 S2 workers（每个 session 一个）
-                        for session_id in range(gpu_sessions):
+                        for session_id in range(pipeline_gpu_sessions):
                             nursery.start_soon(s2_inference_worker, session_id)
                         
                         # 启动 S3 workers

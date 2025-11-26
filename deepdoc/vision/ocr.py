@@ -129,7 +129,16 @@ def load_model(model_dir, nm, device_id: int | None = None, session_id: int = 0)
             providers=['CUDAExecutionProvider'],
             provider_options=[cuda_provider_options]
             )
-        run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:" + str(device_id))
+        # Note: memory.enable_memory_arena_shrinkage should be set only once per device
+        # For multi-session on same GPU, only set it for the first session (session_id=0)
+        # This avoids the "Did not find an arena based allocator" error
+        if session_id == 0:
+            try:
+                run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:" + str(device_id))
+                logging.info(f"load_model {model_file_path} set memory arena shrinkage for device {device_id} (first session)")
+            except Exception as e:
+                # If the config entry already exists or fails, log and continue
+                logging.warning(f"Failed to set memory arena shrinkage for device {device_id}, session {session_id}: {e}")
         logging.info(f"load_model {model_file_path} uses GPU (device_id={device_id}, session_id={session_id}, mem_limit={gpu_mem_limit_mb}MB)")
     else:
         sess = ort.InferenceSession(
