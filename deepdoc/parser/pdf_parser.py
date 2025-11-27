@@ -164,12 +164,25 @@ class RAGFlowPdfParser:
         """
 
         # Use cached OCR instance if available (model preloading)
+        _parser_init_start = time.perf_counter()
+        print(f"[TIMING] RAGFlowPdfParser.__init__ 开始: {_parser_init_start:.6f}")
+        
         use_ocr_cache = os.environ.get("DEEPDOC_OCR_CACHE_ENABLED", "1").lower() in ("1", "true", "yes")
         if use_ocr_cache:
             from ..vision.ocr import get_or_create_ocr_instance
+            _ocr_get_start = time.perf_counter()
+            print(f"[TIMING] 准备获取 OCR 实例 (缓存={use_ocr_cache}): {_ocr_get_start:.6f}")
             self.ocr = get_or_create_ocr_instance(use_cache=True)
+            _ocr_get_end = time.perf_counter()
+            _ocr_get_duration = _ocr_get_end - _ocr_get_start
+            print(f"[TIMING] OCR 实例获取完成: {_ocr_get_end:.6f} (耗时: {_ocr_get_duration:.3f} 秒)")
         else:
+            _ocr_create_start = time.perf_counter()
+            print(f"[TIMING] 准备创建新的 OCR 实例: {_ocr_create_start:.6f}")
             self.ocr = OCR()
+            _ocr_create_end = time.perf_counter()
+            _ocr_create_duration = _ocr_create_end - _ocr_create_start
+            print(f"[TIMING] OCR 实例创建完成: {_ocr_create_end:.6f} (耗时: {_ocr_create_duration:.3f} 秒)")
         self.parallel_limiter = None
         
         # Check if multi-session mode is enabled (for single GPU)

@@ -680,6 +680,9 @@ class OCR:
         ^_-
 
         """
+        _ocr_init_start = time.perf_counter()
+        print(f"[TIMING] OCR.__init__ 开始: {_ocr_init_start:.6f}")
+        
         if not model_dir:
             try:
                 model_dir = os.path.join(
@@ -745,6 +748,10 @@ class OCR:
 
         self.drop_score = 0.5
         self.crop_image_res_index = 0
+        
+        _ocr_init_end = time.perf_counter()
+        _ocr_init_duration = _ocr_init_end - _ocr_init_start
+        print(f"[TIMING] OCR.__init__ 完成: {_ocr_init_end:.6f} (耗时: {_ocr_init_duration:.3f} 秒)")
 
     def get_rotate_crop_image(self, img, points):
         '''
@@ -826,7 +833,14 @@ class OCR:
         return _boxes
 
     def detect(self, img, device_id: int | None = None):
+        # 如果 device_id 为 None，使用第一个 detector（索引 0）
+        # 在 CPU 模式下，text_detector 只有一个元素，所以使用 0
+        # 在 GPU 模式下，如果 device_id 为 None，也使用 0（第一个 GPU）
         if device_id is None:
+            device_id = 0
+        
+        # 确保 device_id 在有效范围内
+        if device_id >= len(self.text_detector):
             device_id = 0
 
         time_dict = {'det': 0, 'rec': 0, 'cls': 0, 'all': 0}
@@ -849,6 +863,10 @@ class OCR:
     def recognize(self, ori_im, box, device_id: int | None = None):
         if device_id is None:
             device_id = 0
+        
+        # 确保 device_id 在有效范围内
+        if device_id >= len(self.text_recognizer):
+            device_id = 0
 
         img_crop = self.get_rotate_crop_image(ori_im, box)
 
@@ -861,6 +879,11 @@ class OCR:
     def recognize_batch(self, img_list, device_id: int | None = None):
         if device_id is None:
             device_id = 0
+        
+        # 确保 device_id 在有效范围内
+        if device_id >= len(self.text_recognizer):
+            device_id = 0
+        
         rec_res, elapse = self.text_recognizer[device_id](img_list)
         texts = []
         for i in range(len(rec_res)):
