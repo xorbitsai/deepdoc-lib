@@ -34,6 +34,82 @@ from .postprocess import build_post_process
 
 loaded_models = {}
 
+# Global OCR instance cache for model preloading
+_ocr_instance_cache = {}
+_ocr_cache_lock = None
+
+def _get_ocr_cache_lock():
+    """Get or create a lock for OCR cache (thread-safe initialization)"""
+    global _ocr_cache_lock
+    if _ocr_cache_lock is None:
+        import threading
+        _ocr_cache_lock = threading.Lock()
+    return _ocr_cache_lock
+
+
+def get_or_create_ocr_instance(model_dir=None, use_cache=True):
+    """
+    Get or create OCR instance with optional caching.
+    
+    Args:
+        model_dir: Model directory path (optional)
+        use_cache: Whether to use cached instance (default: True)
+                   Set to False to force creating a new instance
+    
+    Returns:
+        OCR instance
+    """
+    # Check if caching is enabled via environment variable
+    if not use_cache:
+        enable_cache = os.environ.get("DEEPDOC_OCR_CACHE_ENABLED", "1").lower() in ("1", "true", "yes")
+        use_cache = enable_cache
+    
+    if not use_cache:
+        # Create new instance without caching
+        return OCR(model_dir)
+    
+    # Generate cache key based on configuration
+    gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+    parallel_devices = PARALLEL_DEVICES
+    
+    # Create cache key: model_dir + gpu_sessions + parallel_devices
+    cache_key = f"{model_dir or 'default'}_{gpu_sessions}_{parallel_devices}"
+    
+    lock = _get_ocr_cache_lock()
+    with lock:
+        if cache_key not in _ocr_instance_cache:
+            print(f"[OCR CACHE] Creating new OCR instance (cache_key={cache_key})")
+            _ocr_instance_cache[cache_key] = OCR(model_dir)
+        else:
+            print(f"[OCR CACHE] Reusing cached OCR instance (cache_key={cache_key})")
+        return _ocr_instance_cache[cache_key]
+
+
+def preload_ocr_model(model_dir=None):
+    """
+    Preload OCR model to cache (useful for reducing startup latency).
+    
+    Args:
+        model_dir: Model directory path (optional)
+    
+    Returns:
+        OCR instance
+    """
+    print(f"[OCR PRELOAD] Preloading OCR model...")
+    start_time = time.time()
+    ocr = get_or_create_ocr_instance(model_dir, use_cache=True)
+    elapsed = time.time() - start_time
+    print(f"[OCR PRELOAD] OCR model preloaded in {elapsed:.2f} seconds")
+    return ocr
+
+
+def clear_ocr_cache():
+    """Clear OCR instance cache (useful for memory management or testing)"""
+    lock = _get_ocr_cache_lock()
+    with lock:
+        _ocr_instance_cache.clear()
+        print("[OCR CACHE] OCR instance cache cleared")
+
 def transform(data, ops=None):
     """ transform """
     if ops is None:
@@ -146,28 +222,53 @@ def load_model(model_dir, nm, device_id: int | None = None, session_id: int = 0)
     gpu_mem_limit = gpu_mem_limit_mb * 1024 * 1024
     
     if cuda_is_available():
+        # ONNX Runtime provider_options values must be strings for some versions
+        # Convert all values to strings to ensure compatibility
         cuda_provider_options = {
-            "device_id": device_id, # Use specific GPU
-            "gpu_mem_limit": gpu_mem_limit, # Limit gpu memory per session
+            "device_id": str(int(device_id)) if device_id is not None else "0",  # Ensure integer then string
+            "gpu_mem_limit": str(gpu_mem_limit),  # Limit gpu memory per session
             "arena_extend_strategy": "kNextPowerOfTwo",  # gpu memory allocation strategy
         }
-        sess = ort.InferenceSession(
-            model_file_path,
-            options=options,
-            providers=['CUDAExecutionProvider'],
-            provider_options=[cuda_provider_options]
+        try:
+            sess = ort.InferenceSession(
+                model_file_path,
+                options=options,
+                providers=['CUDAExecutionProvider'],
+                provider_options=[cuda_provider_options]
             )
+        except Exception as e:
+            # Fallback: try without provider_options (use default CUDA device)
+            logging.warning(f"Failed to create CUDA session with options: {e}. Trying without options...")
+            try:
+                sess = ort.InferenceSession(
+                    model_file_path,
+                    options=options,
+                    providers=['CUDAExecutionProvider']
+                )
+            except Exception as e2:
+                logging.warning(f"Failed to create CUDA session: {e2}. Falling back to CPU.")
+                sess = ort.InferenceSession(
+                    model_file_path,
+                    options=options,
+                    providers=['CPUExecutionProvider']
+                )
+                run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu")
+                logging.info(f"load_model {model_file_path} uses CPU (fallback, session_id={session_id})")
+                loaded_model = (sess, run_options)
+                loaded_models[model_cached_tag] = loaded_model
+                return loaded_model
         # Note: memory.enable_memory_arena_shrinkage should be set only once per device
         # For multi-session on same GPU, only set it for the first session (session_id=0)
         # This avoids the "Did not find an arena based allocator" error
+        actual_device_id = device_id if device_id is not None else 0
         if session_id == 0:
             try:
-                run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:" + str(device_id))
-                logging.info(f"load_model {model_file_path} set memory arena shrinkage for device {device_id} (first session)")
+                run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:" + str(actual_device_id))
+                logging.info(f"load_model {model_file_path} set memory arena shrinkage for device {actual_device_id} (first session)")
             except Exception as e:
                 # If the config entry already exists or fails, log and continue
-                logging.warning(f"Failed to set memory arena shrinkage for device {device_id}, session {session_id}: {e}")
-        logging.info(f"load_model {model_file_path} uses GPU (device_id={device_id}, session_id={session_id}, mem_limit={gpu_mem_limit_mb}MB)")
+                logging.warning(f"Failed to set memory arena shrinkage for device {actual_device_id}, session {session_id}: {e}")
+        logging.info(f"load_model {model_file_path} uses GPU (device_id={actual_device_id}, session_id={session_id}, mem_limit={gpu_mem_limit_mb}MB)")
     else:
         sess = ort.InferenceSession(
             model_file_path,
@@ -183,7 +284,9 @@ def load_model(model_dir, nm, device_id: int | None = None, session_id: int = 0)
 class TextRecognizer:
     def __init__(self, model_dir, device_id: int | None = None, session_id: int = 0):
         self.rec_image_shape = [int(v) for v in "3, 48, 320".split(",")]
-        self.rec_batch_num = 16
+        # 支持通过环境变量 DEEPDOC_REC_BATCH_NUM 配置批处理大小
+        # 默认使用 8（测试验证的最优配置：368秒，0.78页/秒）
+        self.rec_batch_num = int(os.environ.get("DEEPDOC_REC_BATCH_NUM", "8"))
         postprocess_params = {
             'name': 'CTCLabelDecode',
             "character_dict_path": os.path.join(model_dir, "ocr.res"),

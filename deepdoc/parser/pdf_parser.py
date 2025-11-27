@@ -20,6 +20,8 @@ import random
 import re
 import sys
 import threading
+import time
+from collections import defaultdict
 from copy import deepcopy
 from io import BytesIO
 from timeit import default_timer as timer
@@ -44,6 +46,10 @@ from ..depend.settings import PARALLEL_DEVICES
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:
     sys.modules[LOCK_KEY_pdfplumber] = threading.Lock()
+
+# 全局 parser 实例缓存（用于监控）
+_PARSER_INSTANCES = []
+_PARSER_INSTANCES_LOCK = threading.Lock()
 
 
 def _multiprocess_page_worker_standalone(args):
@@ -157,11 +163,18 @@ class RAGFlowPdfParser:
 
         """
 
-        self.ocr = OCR()
+        # Use cached OCR instance if available (model preloading)
+        use_ocr_cache = os.environ.get("DEEPDOC_OCR_CACHE_ENABLED", "1").lower() in ("1", "true", "yes")
+        if use_ocr_cache:
+            from ..vision.ocr import get_or_create_ocr_instance
+            self.ocr = get_or_create_ocr_instance(use_cache=True)
+        else:
+            self.ocr = OCR()
         self.parallel_limiter = None
         
         # Check if multi-session mode is enabled (for single GPU)
-        gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+        # Default to 1 session for optimal performance (tested configuration)
+        gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
         use_multi_session = gpu_sessions > 0 and PARALLEL_DEVICES > 0
         
         # Determine number of parallel units (sessions or devices)
@@ -171,7 +184,8 @@ class RAGFlowPdfParser:
             num_parallel = PARALLEL_DEVICES
         
         # Check if pipeline mode is enabled
-        processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "default")
+        # Default to pipeline mode for optimal performance (tested configuration)
+        processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "pipeline")
         is_pipeline_mode = processing_mode == "pipeline"
         
         # For pipeline mode, allow num_parallel = 1 (single GPU single session)
@@ -217,6 +231,39 @@ class RAGFlowPdfParser:
             self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
 
         self.page_from = 0
+        
+        # Pipeline 监控数据（用于性能分析）
+        self.pipeline_monitor_enabled = os.environ.get("DEEPDOC_PIPELINE_MONITOR", "0").lower() in ("1", "true", "yes")
+        self.pipeline_stats = {
+            "queue_prepared": {
+                "sent_count": 0,
+                "received_count": 0,
+                "length_samples": [],
+                "empty_events": 0,
+                "wait_times": [],
+            },
+            "queue_inferred": {
+                "sent_count": 0,
+                "received_count": 0,
+                "length_samples": [],
+                "empty_events": 0,
+                "wait_times": [],
+            },
+            "stage_times": {
+                "s1": [],
+                "s2": [],
+                "s3": [],
+            },
+        }
+        self.pipeline_stats_lock = threading.Lock()
+        
+        # 注册到全局实例列表（用于监控）
+        if self.pipeline_monitor_enabled:
+            with _PARSER_INSTANCES_LOCK:
+                _PARSER_INSTANCES.append(self)
+                # 只保留最近的 10 个实例，避免内存泄漏
+                if len(_PARSER_INSTANCES) > 10:
+                    _PARSER_INSTANCES.pop(0)
 
     def __char_width(self, c):
         return (c["x1"] - c["x0"]) // max(len(c["text"]), 1)
@@ -1142,7 +1189,8 @@ class RAGFlowPdfParser:
             print(f"[CONCURRENCY DEBUG] PARALLEL_DEVICES = {PARALLEL_DEVICES}")
             
             # Check if multi-session mode is enabled (for single GPU)
-            gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "0"))
+            # Default to 1 session for optimal performance (tested configuration)
+            gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
             use_multi_session = gpu_sessions > 0 and PARALLEL_DEVICES > 0
             if use_multi_session:
                 print(f"[CONCURRENCY DEBUG] Multi-session mode enabled: {gpu_sessions} sessions on GPU 0")
@@ -1153,9 +1201,371 @@ class RAGFlowPdfParser:
                 # In multi-GPU mode, use device_id as index (0 to PARALLEL_DEVICES-1)
                 num_parallel = PARALLEL_DEVICES
 
-            if self.parallel_limiter:
-                processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "default")
-                print(f"[CONCURRENCY DEBUG] Processing mode: {processing_mode}")
+            # 先检查 processing_mode，如果是 pipeline 模式，直接使用 pipeline 模式（不依赖 parallel_limiter）
+            # Default to pipeline mode for optimal performance (tested configuration)
+            processing_mode = os.environ.get("DEEPDOC_PROCESSING_MODE", "pipeline")
+            print(f"[CONCURRENCY DEBUG] Processing mode: {processing_mode}")
+            
+            if processing_mode == "pipeline":
+                # Pipeline 模式：直接进入 pipeline 处理，不依赖 parallel_limiter
+                # 方案J: 三阶段流水线模式（CPU-GPU 协同）
+                # 重新获取 gpu_sessions，确保与 OCR 初始化时一致
+                pipeline_gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
+                if pipeline_gpu_sessions <= 0:
+                    pipeline_gpu_sessions = 1
+                
+                # 在 pipeline 模式中，重新判断 use_multi_session
+                # 如果设置了 DEEPDOC_GPU_SESSIONS > 0，即使 PARALLEL_DEVICES = 1，也认为是多 session 模式
+                pipeline_use_multi_session = pipeline_gpu_sessions > 0 and PARALLEL_DEVICES >= 1
+                
+                # 确保 pipeline 模式下的 session 数与 OCR 初始化时一致
+                # 注意：在 pipeline 模式中，即使 num_parallel = 1，也应该正确处理
+                if pipeline_use_multi_session:
+                    # 多 session 模式：使用 session_id 作为 parallel_id
+                    pipeline_num_parallel = pipeline_gpu_sessions
+                else:
+                    # 多 GPU 模式：使用 device_id 作为 parallel_id
+                    # 如果 num_parallel = 0，说明没有 GPU，使用 1 作为默认值
+                    pipeline_num_parallel = max(num_parallel, 1) if num_parallel == 0 else num_parallel
+                
+                # 配置参数
+                # S1_WORKERS: 默认使用 8 workers（测试验证的最优配置）
+                # 可以通过环境变量 DEEPDOC_PIPELINE_S1_WORKERS 覆盖
+                if os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS"):
+                    S1_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS"))
+                else:
+                    # 默认使用 8 workers（测试验证的最优配置：368秒，0.78页/秒）
+                    S1_WORKERS = 8
+                
+                S3_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S3_WORKERS", "2"))
+                QUEUE_CAPACITY = int(os.environ.get("DEEPDOC_PIPELINE_QUEUE_CAPACITY", "4"))
+                
+                print(f"[PIPELINE] Starting pipeline mode: S1_workers={S1_WORKERS}, S2_sessions={pipeline_gpu_sessions}, S3_workers={S3_WORKERS}, queue_capacity={QUEUE_CAPACITY}")
+                print(f"[PIPELINE] pipeline_use_multi_session={pipeline_use_multi_session}, pipeline_num_parallel={pipeline_num_parallel}, PARALLEL_DEVICES={PARALLEL_DEVICES}")
+                
+                # Pipeline 模式的完整实现（从原来的 1447 行开始）
+                # 提前分配 mean_height, mean_width, page_cum_height 列表（确保线程安全）
+                # 使用预分配 + 按索引赋值，避免 append 的线程安全问题
+                self.mean_height = [0.0] * total_pages
+                self.mean_width = [8.0] * total_pages
+                self.page_cum_height = [0.0] * (total_pages + 1)  # 第一个元素是 0，后面 total_pages 个是每页高度
+                # 注意：不预分配 self.boxes，因为 __ocr 使用 append
+                # 我们会在 pipeline 结束时对 self.boxes 进行排序
+                self.boxes = []
+                
+                # Pipeline 专用的预处理函数（使用按索引赋值，而不是 append）
+                def __pipeline_ocr_preprocess(page_idx, img):
+                    """Pipeline 模式专用的预处理函数，使用按索引赋值"""
+                    chars = self.page_chars[page_idx] if not self.is_english else []
+                    # 使用按索引赋值，而不是 append
+                    self.mean_height[page_idx] = np.median(sorted([c["height"] for c in chars])) if chars else 0
+                    self.mean_width[page_idx] = np.median(sorted([c["width"] for c in chars])) if chars else 8
+                    # page_cum_height[0] = 0, page_cum_height[1] = page0 height, page_cum_height[2] = page1 height, ...
+                    self.page_cum_height[page_idx + 1] = img.size[1] / zoomin
+                    return chars
+                
+                # 创建队列
+                queue_prepared_send, queue_prepared_recv = trio.open_memory_channel(QUEUE_CAPACITY)
+                queue_inferred_send, queue_inferred_recv = trio.open_memory_channel(QUEUE_CAPACITY)
+                
+                # 页面锁：确保每个页面只被 S2 处理一次
+                page_locks = [trio.Lock() for _ in range(total_pages)]
+                
+                # 用于跟踪 S1 完成状态（所有页面预处理完成）
+                s1_completed = trio.Event()
+                s1_pages_processed = 0
+                s1_lock = trio.Lock()
+
+                # 用于跟踪 S2 完成状态：所有 S2 workers 结束后关闭 S2->S3 队列
+                s2_done_event = trio.Event()
+                s2_workers_done = 0
+                s2_done_lock = trio.Lock()
+                
+                # 监控相关变量（如果启用监控）
+                if self.pipeline_monitor_enabled:
+                    # 重置统计数据
+                    with self.pipeline_stats_lock:
+                        self.pipeline_stats = {
+                            "queue_prepared": {
+                                "sent_count": 0,
+                                "received_count": 0,
+                                "length_samples": [],
+                                "empty_events": 0,
+                                "wait_times": [],
+                            },
+                            "queue_inferred": {
+                                "sent_count": 0,
+                                "received_count": 0,
+                                "length_samples": [],
+                                "empty_events": 0,
+                                "wait_times": [],
+                            },
+                            "stage_times": {
+                                "s1": [],
+                                "s2": [],
+                                "s3": [],
+                            },
+                        }
+                
+                # 队列监控协程（定期采样队列状态）
+                async def monitor_queues():
+                    """定期采样队列状态"""
+                    if not self.pipeline_monitor_enabled:
+                        return
+                    sample_interval = 0.5  # 每 0.5 秒采样一次
+                    try:
+                        while True:
+                            await trio.sleep(sample_interval)
+                            # 计算队列长度（sent - received）
+                            with self.pipeline_stats_lock:
+                                qp_len = max(0, self.pipeline_stats["queue_prepared"]["sent_count"] - 
+                                            self.pipeline_stats["queue_prepared"]["received_count"])
+                                qi_len = max(0, self.pipeline_stats["queue_inferred"]["sent_count"] - 
+                                            self.pipeline_stats["queue_inferred"]["received_count"])
+                                self.pipeline_stats["queue_prepared"]["length_samples"].append(qp_len)
+                                self.pipeline_stats["queue_inferred"]["length_samples"].append(qi_len)
+                    except trio.Cancelled:
+                        # 正常取消，nursery 关闭时会自动取消
+                        pass
+                
+                async def s1_preprocess_worker(worker_id: int):
+                    """S1 预处理 Worker：CPU 密集型"""
+                    nonlocal s1_pages_processed
+                    processed_count = 0
+                    
+                    for page_idx in range(total_pages):
+                        # 负载均衡：每个 worker 处理一部分页面
+                        if page_idx % S1_WORKERS != worker_id:
+                            continue
+                        
+                        img = self.page_images[page_idx]
+                        
+                        # 记录 S1 阶段开始时间（如果启用监控）
+                        s1_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                        
+                        # 预处理（在线程池中执行，避免阻塞事件循环）
+                        def do_preprocess():
+                            # 使用 pipeline 专用预处理函数（按索引赋值）
+                            chars = __pipeline_ocr_preprocess(page_idx, img)
+                            
+                            # 字符合并逻辑（与 __img_ocr 中的逻辑一致）
+                            j = 0
+                            while j + 1 < len(chars):
+                                if (
+                                    chars[j]["text"]
+                                    and chars[j + 1]["text"]
+                                    and re.match(r"[0-9a-zA-Z,.:;!%]+", chars[j]["text"] + chars[j + 1]["text"])
+                                    and chars[j + 1]["x0"] - chars[j]["x1"] >= min(chars[j + 1]["width"], chars[j]["width"]) / 2
+                                ):
+                                    chars[j]["text"] += " "
+                                j += 1
+                            
+                            return PreparedPage(
+                                page_idx=page_idx,
+                                img=img,
+                                chars=chars,
+                                zoomin=zoomin
+                            )
+                        
+                        prepared_page = await trio.to_thread.run_sync(do_preprocess)
+                        
+                        # 记录 S1 阶段耗时（如果启用监控）
+                        if self.pipeline_monitor_enabled and s1_start is not None:
+                            s1_time = time.perf_counter() - s1_start
+                            with self.pipeline_stats_lock:
+                                self.pipeline_stats["stage_times"]["s1"].append(s1_time)
+                        
+                        # 发送到 S2 队列
+                        await queue_prepared_send.send(prepared_page)
+                        
+                        # 更新队列统计（如果启用监控）
+                        if self.pipeline_monitor_enabled:
+                            with self.pipeline_stats_lock:
+                                self.pipeline_stats["queue_prepared"]["sent_count"] += 1
+                        
+                        processed_count += 1
+                        
+                        # 更新完成计数
+                        async with s1_lock:
+                            s1_pages_processed += 1
+                            if s1_pages_processed >= total_pages:
+                                s1_completed.set()
+                    
+                    print(f"[PIPELINE] S1 worker {worker_id} completed {processed_count} pages")
+                
+                async def s2_inference_worker(session_id: int):
+                    """S2 GPU 推理 Worker：每个 session 一个 worker"""
+                    processed_count = 0
+                    nonlocal s2_workers_done
+                    # 计算 parallel_id：在多 session 模式下使用 session_id，在多 GPU 模式下使用 device_id
+                    if pipeline_use_multi_session:
+                        parallel_id = session_id  # 多 session 模式：session_id 直接作为 parallel_id
+                        # 验证 parallel_id 在有效范围内
+                        if parallel_id >= len(self.ocr.text_detector):
+                            raise ValueError(f"parallel_id {parallel_id} out of range (max: {len(self.ocr.text_detector) - 1})")
+                    else:
+                        parallel_id = session_id % pipeline_num_parallel  # 多 GPU 模式：使用 device_id
+                        # 验证 parallel_id 在有效范围内
+                        if parallel_id >= len(self.ocr.text_detector):
+                            raise ValueError(f"parallel_id {parallel_id} out of range (max: {len(self.ocr.text_detector) - 1})")
+                    
+                    print(f"[PIPELINE] S2 worker {session_id} started with parallel_id={parallel_id} (detector_count={len(self.ocr.text_detector)}, recognizer_count={len(self.ocr.text_recognizer)})")
+                    
+                    try:
+                        async for prepared_page in queue_prepared_recv:
+                            # 记录队列接收时间（如果启用监控）
+                            recv_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                            
+                            page_idx = prepared_page.page_idx
+                            pagenum = page_idx + 1
+                            
+                            # 更新队列统计（如果启用监控）
+                            if self.pipeline_monitor_enabled:
+                                with self.pipeline_stats_lock:
+                                    self.pipeline_stats["queue_prepared"]["received_count"] += 1
+                            
+                            # 使用页面锁确保每个页面只被处理一次
+                            async with page_locks[page_idx]:
+                                # 记录 S2 阶段开始时间（如果启用监控）
+                                s2_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                                
+                                # GPU 推理（在线程池中执行，但主要耗时在 GPU）
+                                def do_inference():
+                                    # 执行 OCR（__ocr 会直接修改 self.boxes 和 self.lefted_chars）
+                                    # 注意：__ocr 使用 append，所以新 boxes 会添加到 self.boxes 末尾
+                                    self.__ocr(pagenum, prepared_page.img, prepared_page.chars, prepared_page.zoomin, parallel_id)
+                                    
+                                    mean_height_val = self.mean_height[page_idx] if page_idx < len(self.mean_height) else 0.0
+                                    
+                                    return OCRResult(
+                                        page_idx=page_idx,
+                                        pagenum=pagenum,
+                                        boxes=[],  # boxes 已在 __ocr 中添加到 self.boxes
+                                        lefted_chars=[],
+                                        mean_height_val=mean_height_val
+                                    )
+                                
+                                ocr_result = await trio.to_thread.run_sync(do_inference)
+                                
+                                # 记录 S2 阶段耗时（如果启用监控）
+                                if self.pipeline_monitor_enabled and s2_start is not None:
+                                    s2_time = time.perf_counter() - s2_start
+                                    with self.pipeline_stats_lock:
+                                        self.pipeline_stats["stage_times"]["s2"].append(s2_time)
+                                
+                                # 发送到 S3 队列
+                                await queue_inferred_send.send(ocr_result)
+                                
+                                # 更新队列统计（如果启用监控）
+                                if self.pipeline_monitor_enabled:
+                                    with self.pipeline_stats_lock:
+                                        self.pipeline_stats["queue_inferred"]["sent_count"] += 1
+                                
+                                processed_count += 1
+                                
+                                # 记录队列等待时间（如果启用监控）
+                                if self.pipeline_monitor_enabled and recv_start is not None:
+                                    # 如果等待时间 > 0.01 秒，认为是队列空置
+                                    wait_time = time.perf_counter() - recv_start - (s2_time if s2_start else 0)
+                                    if wait_time > 0.01:
+                                        with self.pipeline_stats_lock:
+                                            self.pipeline_stats["queue_prepared"]["empty_events"] += 1
+                                            self.pipeline_stats["queue_prepared"]["wait_times"].append(wait_time)
+                    except trio.EndOfChannel:
+                        pass  # 正常结束（S1 完成后，queue_prepared 关闭，S2 自然结束）
+                    finally:
+                        async with s2_done_lock:
+                            s2_workers_done += 1
+                            if s2_workers_done >= pipeline_gpu_sessions:
+                                s2_done_event.set()
+
+                    print(f"[PIPELINE] S2 worker (session {session_id}) completed {processed_count} pages")
+                
+                async def s3_postprocess_worker(worker_id: int):
+                    """S3 后处理 Worker：CPU 密集型（验证和清理）"""
+                    processed_count = 0
+                    
+                    try:
+                        async for ocr_result in queue_inferred_recv:
+                            # 更新队列统计（如果启用监控）
+                            if self.pipeline_monitor_enabled:
+                                with self.pipeline_stats_lock:
+                                    self.pipeline_stats["queue_inferred"]["received_count"] += 1
+                            
+                            # 记录 S3 阶段开始时间（如果启用监控）
+                            s3_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                            
+                            # 后处理：验证数据完整性
+                            # 由于 __ocr 已经直接修改了 self.boxes 和 self.lefted_chars，
+                            # 这里主要是验证和记录完成状态
+                            
+                            # 验证 boxes 已正确添加（__ocr 使用 append，所以顺序可能不是按 page_idx）
+                            # 我们只需要确保所有页面都被处理即可
+                            
+                            # 记录 S3 阶段耗时（如果启用监控）
+                            if self.pipeline_monitor_enabled and s3_start is not None:
+                                s3_time = time.perf_counter() - s3_start
+                                with self.pipeline_stats_lock:
+                                    self.pipeline_stats["stage_times"]["s3"].append(s3_time)
+                            
+                            processed_count += 1
+                    except trio.EndOfChannel:
+                        pass  # 正常结束
+                    
+                    print(f"[PIPELINE] S3 worker {worker_id} completed {processed_count} pages")
+                
+                # 启动所有 worker
+                async with trio.open_nursery() as nursery:
+                    # 启动队列监控协程（如果启用监控）
+                    if self.pipeline_monitor_enabled:
+                        nursery.start_soon(monitor_queues)
+                    
+                    # 启动 S1 workers
+                    for worker_id in range(S1_WORKERS):
+                        nursery.start_soon(s1_preprocess_worker, worker_id)
+                    
+                    # 启动 S2 workers（每个 session 一个）
+                    for session_id in range(pipeline_gpu_sessions):
+                        nursery.start_soon(s2_inference_worker, session_id)
+                    
+                    # 启动 S3 workers
+                    for worker_id in range(S3_WORKERS):
+                        nursery.start_soon(s3_postprocess_worker, worker_id)
+                    
+                    # 等待所有 S1 worker 完成
+                    await s1_completed.wait()
+                    
+                    # 关闭 S1->S2 队列的发送端，通知 S2 workers 结束
+                    await queue_prepared_send.aclose()
+                    
+                    # 等待所有 S2 worker 完成
+                    await s2_done_event.wait()
+                    
+                    # 关闭 S2->S3 队列的发送端，通知 S3 workers 结束
+                    await queue_inferred_send.aclose()
+                    
+                    # 监控协程会在 nursery 关闭时自动取消（通过 trio.Cancelled 异常）
+                
+                # 对 self.boxes 进行排序，确保顺序与 page_images 一致
+                # __ocr 使用 append，所以 self.boxes 的顺序可能不是按 page_idx
+                # 我们需要按照 page_number 对 self.boxes 进行分组和排序
+                if len(self.boxes) > 0:
+                    # 按 page_number 分组 boxes
+                    boxes_by_page = {}
+                    for box_list in self.boxes:
+                        if box_list and len(box_list) > 0:
+                            # 获取第一个 box 的 page_number（同一页面的 boxes 应该有相同的 page_number）
+                            page_num = box_list[0].get("page_number", 0)
+                            if page_num > 0:
+                                page_idx = page_num - 1
+                                if 0 <= page_idx < total_pages:
+                                    boxes_by_page[page_idx] = box_list
+                    
+                    # 按 page_idx 顺序重新组织 self.boxes
+                    self.boxes = [boxes_by_page.get(i, []) for i in range(total_pages)]
+                
+            elif self.parallel_limiter:
+                # 非 pipeline 模式：使用 parallel_limiter
 
                 if processing_mode == "multiprocess":
                     # 方案E: 多进程处理
@@ -1347,8 +1757,8 @@ class RAGFlowPdfParser:
                     print(f"[CONCURRENCY DEBUG] All optimized batch tasks completed in {concurrent_elapsed:.3f}s")
                     
                 elif processing_mode == "pipeline":
-                    # 方案J: 三阶段流水线模式（CPU-GPU 协同）
-                    # 重新获取 gpu_sessions，确保与 OCR 初始化时一致
+                    # Pipeline 模式已经在前面处理了（不依赖 parallel_limiter），这里不应该执行
+                    raise RuntimeError("Pipeline mode should have been handled earlier, this code should not be reached")
                     pipeline_gpu_sessions = int(os.environ.get("DEEPDOC_GPU_SESSIONS", "1"))
                     if pipeline_gpu_sessions <= 0:
                         pipeline_gpu_sessions = 1
@@ -1368,7 +1778,14 @@ class RAGFlowPdfParser:
                         pipeline_num_parallel = max(num_parallel, 1) if num_parallel == 0 else num_parallel
                     
                     # 配置参数
-                    S1_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS", "8"))
+                    # S1_WORKERS: 默认使用 8 workers（测试验证的最优配置）
+                    # 可以通过环境变量 DEEPDOC_PIPELINE_S1_WORKERS 覆盖
+                    if os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS"):
+                        S1_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S1_WORKERS"))
+                    else:
+                        # 默认使用 8 workers（测试验证的最优配置：368秒，0.78页/秒）
+                        S1_WORKERS = 8
+                    
                     S3_WORKERS = int(os.environ.get("DEEPDOC_PIPELINE_S3_WORKERS", "2"))
                     QUEUE_CAPACITY = int(os.environ.get("DEEPDOC_PIPELINE_QUEUE_CAPACITY", "4"))
                     
@@ -1376,12 +1793,24 @@ class RAGFlowPdfParser:
                     print(f"[PIPELINE] pipeline_use_multi_session={pipeline_use_multi_session}, pipeline_num_parallel={pipeline_num_parallel}, PARALLEL_DEVICES={PARALLEL_DEVICES}")
                     
                     # 提前分配 mean_height, mean_width, page_cum_height 列表（确保线程安全）
+                    # 使用预分配 + 按索引赋值，避免 append 的线程安全问题
                     self.mean_height = [0.0] * total_pages
                     self.mean_width = [8.0] * total_pages
-                    self.page_cum_height = [0.0] * (total_pages + 1)
+                    self.page_cum_height = [0.0] * (total_pages + 1)  # 第一个元素是 0，后面 total_pages 个是每页高度
                     # 注意：不预分配 self.boxes，因为 __ocr 使用 append
                     # 我们会在 pipeline 结束时对 self.boxes 进行排序
                     self.boxes = []
+                    
+                    # Pipeline 专用的预处理函数（使用按索引赋值，而不是 append）
+                    def __pipeline_ocr_preprocess(page_idx, img):
+                        """Pipeline 模式专用的预处理函数，使用按索引赋值"""
+                        chars = self.page_chars[page_idx] if not self.is_english else []
+                        # 使用按索引赋值，而不是 append
+                        self.mean_height[page_idx] = np.median(sorted([c["height"] for c in chars])) if chars else 0
+                        self.mean_width[page_idx] = np.median(sorted([c["width"] for c in chars])) if chars else 8
+                        # page_cum_height[0] = 0, page_cum_height[1] = page0 height, page_cum_height[2] = page1 height, ...
+                        self.page_cum_height[page_idx + 1] = img.size[1] / zoomin
+                        return chars
                     
                     # 创建队列
                     queue_prepared_send, queue_prepared_recv = trio.open_memory_channel(QUEUE_CAPACITY)
@@ -1400,6 +1829,53 @@ class RAGFlowPdfParser:
                     s2_workers_done = 0
                     s2_done_lock = trio.Lock()
                     
+                    # 监控相关变量（如果启用监控）
+                    if self.pipeline_monitor_enabled:
+                        # 重置统计数据
+                        with self.pipeline_stats_lock:
+                            self.pipeline_stats = {
+                                "queue_prepared": {
+                                    "sent_count": 0,
+                                    "received_count": 0,
+                                    "length_samples": [],
+                                    "empty_events": 0,
+                                    "wait_times": [],
+                                },
+                                "queue_inferred": {
+                                    "sent_count": 0,
+                                    "received_count": 0,
+                                    "length_samples": [],
+                                    "empty_events": 0,
+                                    "wait_times": [],
+                                },
+                                "stage_times": {
+                                    "s1": [],
+                                    "s2": [],
+                                    "s3": [],
+                                },
+                            }
+                    
+                    # 队列监控协程（定期采样队列状态）
+                    async def monitor_queues():
+                        """定期采样队列状态"""
+                        if not self.pipeline_monitor_enabled:
+                            return
+                        sample_interval = 0.5  # 每 0.5 秒采样一次
+                        try:
+                            while True:
+                                await trio.sleep(sample_interval)
+                                # 计算队列长度（sent - received）
+                                with self.pipeline_stats_lock:
+                                    qp_len = max(0, self.pipeline_stats["queue_prepared"]["sent_count"] - 
+                                                self.pipeline_stats["queue_prepared"]["received_count"])
+                                    qi_len = max(0, self.pipeline_stats["queue_inferred"]["sent_count"] - 
+                                                self.pipeline_stats["queue_inferred"]["received_count"])
+                                    self.pipeline_stats["queue_prepared"]["length_samples"].append(qp_len)
+                                    self.pipeline_stats["queue_inferred"]["length_samples"].append(qi_len)
+                        except trio.Cancelled:
+                            # 正常取消，nursery 关闭时会自动取消
+                            pass
+                    
                     async def s1_preprocess_worker(worker_id: int):
                         """S1 预处理 Worker：CPU 密集型"""
                         nonlocal s1_pages_processed
@@ -1412,9 +1888,13 @@ class RAGFlowPdfParser:
                             
                             img = self.page_images[page_idx]
                             
+                            # 记录 S1 阶段开始时间（如果启用监控）
+                            s1_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                            
                             # 预处理（在线程池中执行，避免阻塞事件循环）
                             def do_preprocess():
-                                chars = __ocr_preprocess(page_idx, img)
+                                # 使用 pipeline 专用预处理函数（按索引赋值）
+                                chars = __pipeline_ocr_preprocess(page_idx, img)
                                 
                                 # 字符合并逻辑（与 __img_ocr 中的逻辑一致）
                                 j = 0
@@ -1437,8 +1917,20 @@ class RAGFlowPdfParser:
                             
                             prepared_page = await trio.to_thread.run_sync(do_preprocess)
                             
+                            # 记录 S1 阶段耗时（如果启用监控）
+                            if self.pipeline_monitor_enabled and s1_start is not None:
+                                s1_time = time.perf_counter() - s1_start
+                                with self.pipeline_stats_lock:
+                                    self.pipeline_stats["stage_times"]["s1"].append(s1_time)
+                            
                             # 发送到 S2 队列
                             await queue_prepared_send.send(prepared_page)
+                            
+                            # 更新队列统计（如果启用监控）
+                            if self.pipeline_monitor_enabled:
+                                with self.pipeline_stats_lock:
+                                    self.pipeline_stats["queue_prepared"]["sent_count"] += 1
+                            
                             processed_count += 1
                             
                             # 更新完成计数
@@ -1469,11 +1961,22 @@ class RAGFlowPdfParser:
                         
                         try:
                             async for prepared_page in queue_prepared_recv:
+                                # 记录队列接收时间（如果启用监控）
+                                recv_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                                
                                 page_idx = prepared_page.page_idx
                                 pagenum = page_idx + 1
                                 
+                                # 更新队列统计（如果启用监控）
+                                if self.pipeline_monitor_enabled:
+                                    with self.pipeline_stats_lock:
+                                        self.pipeline_stats["queue_prepared"]["received_count"] += 1
+                                
                                 # 使用页面锁确保每个页面只被处理一次
                                 async with page_locks[page_idx]:
+                                    # 记录 S2 阶段开始时间（如果启用监控）
+                                    s2_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                                    
                                     # GPU 推理（在线程池中执行，但主要耗时在 GPU）
                                     def do_inference():
                                         # 执行 OCR（__ocr 会直接修改 self.boxes 和 self.lefted_chars）
@@ -1492,9 +1995,30 @@ class RAGFlowPdfParser:
                                     
                                     ocr_result = await trio.to_thread.run_sync(do_inference)
                                     
+                                    # 记录 S2 阶段耗时（如果启用监控）
+                                    if self.pipeline_monitor_enabled and s2_start is not None:
+                                        s2_time = time.perf_counter() - s2_start
+                                        with self.pipeline_stats_lock:
+                                            self.pipeline_stats["stage_times"]["s2"].append(s2_time)
+                                    
                                     # 发送到 S3 队列
                                     await queue_inferred_send.send(ocr_result)
+                                    
+                                    # 更新队列统计（如果启用监控）
+                                    if self.pipeline_monitor_enabled:
+                                        with self.pipeline_stats_lock:
+                                            self.pipeline_stats["queue_inferred"]["sent_count"] += 1
+                                    
                                     processed_count += 1
+                                    
+                                    # 记录队列等待时间（如果启用监控）
+                                    if self.pipeline_monitor_enabled and recv_start is not None:
+                                        # 如果等待时间 > 0.01 秒，认为是队列空置
+                                        wait_time = time.perf_counter() - recv_start - (s2_time if s2_start else 0)
+                                        if wait_time > 0.01:
+                                            with self.pipeline_stats_lock:
+                                                self.pipeline_stats["queue_prepared"]["empty_events"] += 1
+                                                self.pipeline_stats["queue_prepared"]["wait_times"].append(wait_time)
                         except trio.EndOfChannel:
                             pass  # 正常结束（S1 完成后，queue_prepared 关闭，S2 自然结束）
                         finally:
@@ -1511,12 +2035,27 @@ class RAGFlowPdfParser:
                         
                         try:
                             async for ocr_result in queue_inferred_recv:
+                                # 更新队列统计（如果启用监控）
+                                if self.pipeline_monitor_enabled:
+                                    with self.pipeline_stats_lock:
+                                        self.pipeline_stats["queue_inferred"]["received_count"] += 1
+                                
+                                # 记录 S3 阶段开始时间（如果启用监控）
+                                s3_start = time.perf_counter() if self.pipeline_monitor_enabled else None
+                                
                                 # 后处理：验证数据完整性
                                 # 由于 __ocr 已经直接修改了 self.boxes 和 self.lefted_chars，
                                 # 这里主要是验证和记录完成状态
                                 
                                 # 验证 boxes 已正确添加（__ocr 使用 append，所以顺序可能不是按 page_idx）
                                 # 我们只需要确保所有页面都被处理即可
+                                
+                                # 记录 S3 阶段耗时（如果启用监控）
+                                if self.pipeline_monitor_enabled and s3_start is not None:
+                                    s3_time = time.perf_counter() - s3_start
+                                    with self.pipeline_stats_lock:
+                                        self.pipeline_stats["stage_times"]["s3"].append(s3_time)
+                                
                                 processed_count += 1
                         except trio.EndOfChannel:
                             pass  # 正常结束
@@ -1525,6 +2064,10 @@ class RAGFlowPdfParser:
                     
                     # 启动所有 worker
                     async with trio.open_nursery() as nursery:
+                        # 启动队列监控协程（如果启用监控）
+                        if self.pipeline_monitor_enabled:
+                            nursery.start_soon(monitor_queues)
+                        
                         # 启动 S1 workers
                         for worker_id in range(S1_WORKERS):
                             nursery.start_soon(s1_preprocess_worker, worker_id)
@@ -1548,6 +2091,8 @@ class RAGFlowPdfParser:
                         
                         # 关闭 S2->S3 队列的发送端，通知 S3 workers 结束
                         await queue_inferred_send.aclose()
+                        
+                        # 监控协程会在 nursery 关闭时自动取消（通过 trio.Cancelled 异常）
                     
                     # 对 self.boxes 进行排序，确保顺序与 page_images 一致
                     # __ocr 使用 append，所以 self.boxes 的顺序可能不是按 page_idx

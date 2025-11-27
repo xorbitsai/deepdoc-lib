@@ -53,6 +53,8 @@ jobs:
 
   publish-to-testpypi:
     name: Publish Python 🐍 distribution 📦 to TestPyPI
+    # Only publish to TestPyPI on feature branches (for testing)
+    if: startsWith(github.ref, 'refs/heads/feature/') || startsWith(github.ref, 'refs/tags/')
     needs:
     - build
     runs-on: ubuntu-latest
