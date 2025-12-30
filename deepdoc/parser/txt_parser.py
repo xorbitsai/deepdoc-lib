@@ -16,8 +16,8 @@
 
 import re
 
-from ..parser.utils import get_text
-from ..depend.num_tokens_from_string import num_tokens_from_string
+from deepdoc.parser.utils import get_text
+from ..common.token_utils import num_tokens_from_string
 
 
 class RAGFlowTxtParser:

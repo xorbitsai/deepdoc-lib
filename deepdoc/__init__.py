@@ -15,11 +15,11 @@
 #
 
 from beartype.claw import beartype_this_package
-
 beartype_this_package()
 
 from .parser import *
 from .depend.simple_cv_model import *
+from .llm_adapter import LLMAdapter, LLMType, vision_llm_chunk
 
 __all__ = [
     "PdfParser",
@@ -31,4 +31,8 @@ __all__ = [
     "JsonParser",
     "MarkdownParser",
     "TxtParser",
+    # LLM Adapter exports
+    "LLMAdapter",
+    "LLMType",
+    "vision_llm_chunk",
 ]

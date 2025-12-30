@@ -13,7 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-
+import gc
 import logging
 import os
 import math
@@ -22,7 +22,7 @@ import cv2
 from functools import cmp_to_key
 
 
-from ..depend.file_utils import get_project_base_directory
+from ..common.file_utils import get_project_base_directory
 from .operators import *  # noqa: F403
 from .operators import preprocess
 from . import operators
@@ -44,7 +44,7 @@ class Recognizer:
         if not model_dir:
             model_dir = os.path.join(
                         get_project_base_directory(),
-                        "dict/ocr")
+                        "rag/res/deepdoc")
         self.ort_sess, self.run_options = load_model(model_dir, task_name)
         self.input_names = [node.name for node in self.ort_sess.get_inputs()]
         self.output_names = [node.name for node in self.ort_sess.get_outputs()]
@@ -406,6 +406,12 @@ class Recognizer:
             "score": float(scores[i])
         } for i in indices]
 
+    def close(self):
+        logging.info("Close recognizer.")
+        if hasattr(self, "ort_sess"):
+            del self.ort_sess
+        gc.collect()
+
     def __call__(self, image_list, thr=0.7, batch_size=16):
         res = []
         images = []
@@ -430,5 +436,7 @@ class Recognizer:
 
         return res
 
+    def __del__(self):
+        self.close()
 
 

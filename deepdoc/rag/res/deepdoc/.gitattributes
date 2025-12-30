@@ -1,0 +1,3 @@
+# 覆盖父目录的LFS规则，将这些模型文件直接存放在git仓库中
+*.onnx -filter -diff -merge
+*.model -filter -diff -merge

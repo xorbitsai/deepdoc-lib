@@ -59,7 +59,7 @@ ensure_nltk_data()
 # 然后正常导入 NLTK
 from nltk import word_tokenize
 from nltk.stem import PorterStemmer, WordNetLemmatizer
-from ..depend.file_utils import get_project_base_directory
+from ..common.file_utils import get_project_base_directory
 
 
 class RagTokenizer:
@@ -498,15 +498,15 @@ def naiveQie(txt):
     return tks
 
 
-tokenizer = RagTokenizer()
-tokenize = tokenizer.tokenize
-fine_grained_tokenize = tokenizer.fine_grained_tokenize
-tag = tokenizer.tag
-freq = tokenizer.freq
-loadUserDict = tokenizer.loadUserDict
-addUserDict = tokenizer.addUserDict
-tradi2simp = tokenizer._tradi2simp
-strQ2B = tokenizer._strQ2B
+rag_tokenizer = RagTokenizer()
+tokenize = rag_tokenizer.tokenize
+fine_grained_tokenize = rag_tokenizer.fine_grained_tokenize
+tag = rag_tokenizer.tag
+freq = rag_tokenizer.freq
+loadUserDict = rag_tokenizer.loadUserDict
+addUserDict = rag_tokenizer.addUserDict
+tradi2simp = rag_tokenizer._tradi2simp
+strQ2B = rag_tokenizer._strQ2B
 
 if __name__ == '__main__':
     tknzr = RagTokenizer(debug=True)

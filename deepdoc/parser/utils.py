@@ -23,14 +23,10 @@ def get_text(fnm: str, binary=None) -> str:
         encoding = find_codec(binary)
         txt = binary.decode(encoding, errors="ignore")
     else:
-        # 先尝试UTF-8
-        try:
-            with open(fnm, "r", encoding="utf-8") as f:
-                txt = f.read()
-        except UnicodeDecodeError:
-            # 如果UTF-8失败，使用find_codec检测编码
-            with open(fnm, "rb") as f:
-                binary_content = f.read()
-            encoding = find_codec(binary_content)
-            txt = binary_content.decode(encoding, errors="ignore")
+        with open(fnm, "r") as f:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                txt += line
     return txt
