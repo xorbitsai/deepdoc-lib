@@ -73,14 +73,15 @@ class LLMServiceInterface:
 class FenixAOSLLMService(LLMServiceInterface):
     """LLM Service adapter for FenixAOS environment"""
 
-    def __init__(self, tenant_id: str, llm_type: LLMType, llm_name: Optional[str] = None, **kwargs):
+    def __init__(self, tenant_id: Optional[str], llm_type: LLMType, llm_name: Optional[str] = None, **kwargs):
         self.tenant_id = tenant_id
         self.llm_type = llm_type
         self.llm_name = llm_name
+        self._api_key = kwargs.get('api_key')
+        self._base_url = kwargs.get('base_url')
 
-        # Try to create LLMBundle-like service from FenixAOS
+        # Try to create vision service from FenixAOS
         try:
-            # This would need to be implemented based on FenixAOS's actual API
             self._service = self._create_fenix_service()
         except Exception as e:
             logger.warning(f"Failed to create FenixAOS LLM service: {e}")
@@ -88,8 +89,27 @@ class FenixAOSLLMService(LLMServiceInterface):
 
     def _create_fenix_service(self):
         """Create service using FenixAOS APIs"""
-        # Placeholder - needs to be implemented based on actual FenixAOS APIs
-        raise NotImplementedError("FenixAOS service creation not implemented yet")
+        # Try to get vision model from FenixAOS
+        try:
+            # Import FenixAOS components
+            from fenixaos.core.model.image.adapter import ImageModelAdapter
+            from fenixaos.core.model.model import ImageModelConfig
+
+            # Create vision model config
+            config = ImageModelConfig(
+                id=f"deepdoc_vision_{self.llm_name or 'default'}",
+                model_name=self.llm_name or "gpt-4-vision-preview",
+                model_provider="openai",  # Default to OpenAI
+                api_key=getattr(self, '_api_key', None),
+                base_url=getattr(self, '_base_url', None),
+            )
+
+            # Create and return adapter
+            return ImageModelAdapter(config)
+
+        except Exception as e:
+            logger.error(f"Failed to create FenixAOS vision service: {e}")
+            raise
 
     def describe_with_prompt(self, image: Union[bytes, Any], prompt: Optional[str] = None) -> str:
         return self._service.describe_with_prompt(image, prompt)
@@ -148,7 +168,8 @@ class LLMAdapter:
 
     def _create_service(self) -> LLMServiceInterface:
         """Create appropriate LLM service based on environment"""
-        if FENIXAOS_AVAILABLE and self.tenant_id:
+        # Always try FenixAOS first if available, regardless of tenant_id
+        if FENIXAOS_AVAILABLE:
             try:
                 return FenixAOSLLMService(self.tenant_id, self.llm_type, self.llm_name, **self.kwargs)
             except Exception as e:
