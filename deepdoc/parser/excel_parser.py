@@ -20,7 +20,7 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 from PIL import Image
 
-from rag.nlp import find_codec
+from .depend.find_codec import find_codec
 
 # copied from `/openpyxl/cell/cell.py`
 ILLEGAL_CHARACTERS_RE = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]")

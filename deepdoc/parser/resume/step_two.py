@@ -24,7 +24,7 @@ import traceback
 import signal
 import numpy as np
 from deepdoc.parser.resume.entities import degrees, schools, corporations
-from rag.nlp import rag_tokenizer, surname
+from .depend.rag_tokenizer import tokenize, fine_grained_tokenize, tag, freq, loadUserDict, addUserDict, tradi2simp, strQ2B
 from xpinyin import Pinyin
 from contextlib import contextmanager
 

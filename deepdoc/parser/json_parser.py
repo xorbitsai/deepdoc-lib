@@ -21,7 +21,7 @@
 import json
 from typing import Any
 
-from rag.nlp import find_codec
+from ..depend.find_codec import find_codec
 
 
 class RAGFlowJsonParser:

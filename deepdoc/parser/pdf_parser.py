@@ -36,11 +36,11 @@ from pypdf import PdfReader as pdf2_read
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from common.file_utils import get_project_base_directory
-from common.misc_utils import pip_install_torch
+from .common.file_utils import get_project_base_directory
+from .common.misc_utils import pip_install_torch
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
-from rag.nlp import rag_tokenizer
-from rag.prompts.generator import vision_llm_describe_prompt
+from .depend.rag_tokenizer import *
+from .depend.prompts import vision_llm_describe_prompt
 from common import settings
 
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
@@ -1477,7 +1477,7 @@ class VisionParser(RAGFlowPdfParser):
             if pdf_page_num < start_page or pdf_page_num >= end_page:
                 continue
 
-            from rag.app.picture import vision_llm_chunk as picture_vision_llm_chunk
+            from .llm_adapter.vision import vision_llm_chunk as picture_vision_llm_chunk
 
             text = picture_vision_llm_chunk(
                 binary=img_binary,
