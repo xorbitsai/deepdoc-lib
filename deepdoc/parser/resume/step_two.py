@@ -24,8 +24,8 @@ import traceback
 import signal
 import numpy as np
 from .entities import degrees, schools, corporations
-from ..depend.rag_tokenizer import tokenize, fine_grained_tokenize, tag, freq, loadUserDict, addUserDict, tradi2simp, strQ2B
-from ..depend.surname import surname
+from ...depend.rag_tokenizer import tokenize, fine_grained_tokenize, tag, freq, loadUserDict, addUserDict, tradi2simp, strQ2B
+from ...depend.surname import surname
 from xpinyin import Pinyin
 from contextlib import contextmanager
 
