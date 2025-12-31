@@ -10,6 +10,7 @@ from .token_utils import num_tokens_from_string, total_token_count_from_response
 from .misc_utils import pip_install_torch
 from .connection_utils import timeout
 from .config_utils import get_base_config, get_config_value
+from .settings import PARALLEL_DEVICES, check_and_install_torch
 
 __all__ = [
     # file_utils
@@ -30,4 +31,8 @@ __all__ = [
     # config_utils
     "get_base_config",
     "get_config_value",
+
+    # settings
+    "PARALLEL_DEVICES",
+    "check_and_install_torch",
 ]

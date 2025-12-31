@@ -36,12 +36,12 @@ from pypdf import PdfReader as pdf2_read
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from .common.file_utils import get_project_base_directory
-from .common.misc_utils import pip_install_torch
+from ..common.file_utils import get_project_base_directory
+from ..common.misc_utils import pip_install_torch
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
-from .depend.rag_tokenizer import *
-from .depend.prompts import vision_llm_describe_prompt
-from common import settings
+from ..depend.rag_tokenizer import *
+from ..depend.prompts import vision_llm_describe_prompt
+from ..common import settings
 
 LOCK_KEY_pdfplumber = "global_shared_lock_pdfplumber"
 if LOCK_KEY_pdfplumber not in sys.modules:

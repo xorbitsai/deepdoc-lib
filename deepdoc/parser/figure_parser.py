@@ -19,13 +19,13 @@ from PIL import Image
 
 from .llm_adapter import LLMType, LLMAdapter
 from .llm_adapter.vision import vision_llm_chunk as picture_vision_llm_chunk
-from .depend.prompts import vision_llm_figure_describe_prompt
+from ..depend.prompts import vision_llm_figure_describe_prompt
 
 # Try to import timeout from common, fallback to local
 try:
-    from .common.connection_utils import timeout
+    from ..common.connection_utils import timeout
 except ImportError:
-    from .depend.timeout import timeout
+    from ..depend.timeout import timeout
 
 
 def vision_figure_parser_figure_data_wrapper(figures_data_without_positions):

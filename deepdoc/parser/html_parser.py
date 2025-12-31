@@ -15,7 +15,8 @@
 #  limitations under the License.
 #
 
-from .depend.find_codec import find_codec, rag_tokenizer
+from ..depend.find_codec import find_codec
+from ..depend.rag_tokenizer import *
 import uuid
 import chardet
 from bs4 import BeautifulSoup, NavigableString, Tag, Comment

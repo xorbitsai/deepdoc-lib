@@ -21,9 +21,9 @@ import os
 
 from huggingface_hub import snapshot_download
 
-from .common.file_utils import get_project_base_directory
-from .common.misc_utils import pip_install_torch
-from common import settings
+from ..common.file_utils import get_project_base_directory
+from ..common.misc_utils import pip_install_torch
+from ..common import settings
 from .operators import *  # noqa: F403
 from . import operators
 import math

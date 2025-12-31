@@ -19,7 +19,7 @@ import re
 import json
 import os
 import pandas as pd
-from .depend.rag_tokenizer import *
+from ..depend.rag_tokenizer import *
 from . import regions
 
 
