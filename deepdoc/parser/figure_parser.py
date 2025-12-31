@@ -17,12 +17,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
-from ..depend.timeout import timeout
-from ..depend.vision_llm_chunk import vision_llm_chunk as picture_vision_llm_chunk
+from .llm_adapter import LLMType, LLMAdapter
+from .llm_adapter.vision import vision_llm_chunk as picture_vision_llm_chunk
 from ..depend.prompts import vision_llm_figure_describe_prompt
+
+# Try to import timeout from common, fallback to local
+try:
+    from ..common.connection_utils import timeout
+except ImportError:
+    from ..depend.timeout import timeout
 
 
 def vision_figure_parser_figure_data_wrapper(figures_data_without_positions):
+    if not figures_data_without_positions:
+        return []
     return [
         (
             (figure_data[1], [figure_data[0]]),
@@ -31,6 +39,75 @@ def vision_figure_parser_figure_data_wrapper(figures_data_without_positions):
         for figure_data in figures_data_without_positions
         if isinstance(figure_data[1], Image.Image)
     ]
+
+
+def vision_figure_parser_docx_wrapper(sections, tbls, callback=None,**kwargs):
+    if not sections:
+        return tbls
+    try:
+        vision_model = LLMAdapter(kwargs.get("tenant_id"), LLMType.IMAGE2TEXT)
+        callback(0.7, "Visual model detected. Attempting to enhance figure extraction...")
+    except Exception:
+        vision_model = None
+    if vision_model:
+        figures_data = vision_figure_parser_figure_data_wrapper(sections)
+        try:
+            docx_vision_parser = VisionFigureParser(vision_model=vision_model, figures_data=figures_data, **kwargs)
+            boosted_figures = docx_vision_parser(callback=callback)
+            tbls.extend(boosted_figures)
+        except Exception as e:
+            callback(0.8, f"Visual model error: {e}. Skipping figure parsing enhancement.")
+    return tbls
+
+def vision_figure_parser_figure_xlsx_wrapper(images,callback=None, **kwargs):
+    tbls = []
+    if not images:
+        return []
+    try:
+        vision_model = LLMAdapter(kwargs.get("tenant_id"), LLMType.IMAGE2TEXT)
+        callback(0.2, "Visual model detected. Attempting to enhance Excel image extraction...")
+    except Exception:
+        vision_model = None
+    if vision_model:
+        figures_data = [((
+                        img["image"],   # Image.Image
+                        [img["image_description"]]     # description list (must be list)
+                    ),
+                    [
+                        (0, 0, 0, 0, 0)   # dummy position
+                    ]) for img in images]
+        try:
+            parser = VisionFigureParser(vision_model=vision_model, figures_data=figures_data, **kwargs)
+            callback(0.22, "Parsing images...")
+            boosted_figures = parser(callback=callback)
+            tbls.extend(boosted_figures)
+        except Exception as e:
+            callback(0.25, f"Excel visual model error: {e}. Skipping vision enhancement.")
+    return tbls
+
+def vision_figure_parser_pdf_wrapper(tbls, callback=None, **kwargs):
+    if not tbls:
+        return []
+    try:
+        vision_model = LLMAdapter(kwargs.get("tenant_id"), LLMType.IMAGE2TEXT)
+        callback(0.7, "Visual model detected. Attempting to enhance figure extraction...")
+    except Exception:
+        vision_model = None
+    if vision_model:
+        def is_figure_item(item):
+            return (
+                isinstance(item[0][0], Image.Image) and
+                isinstance(item[0][1], list)
+            )
+        figures_data = [item for item in tbls if is_figure_item(item)]
+        try:
+            docx_vision_parser = VisionFigureParser(vision_model=vision_model, figures_data=figures_data, **kwargs)
+            boosted_figures = docx_vision_parser(callback=callback)
+            tbls = [item for item in tbls if not is_figure_item(item)]
+            tbls.extend(boosted_figures)
+        except Exception as e:
+            callback(0.8, f"Visual model error: {e}. Skipping figure parsing enhancement.")
+    return tbls
 
 
 shared_executor = ThreadPoolExecutor(max_workers=10)

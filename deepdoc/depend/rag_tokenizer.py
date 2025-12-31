@@ -59,7 +59,7 @@ ensure_nltk_data()
 # 然后正常导入 NLTK
 from nltk import word_tokenize
 from nltk.stem import PorterStemmer, WordNetLemmatizer
-from ..depend.file_utils import get_project_base_directory
+from ..common.file_utils import get_project_base_directory
 
 
 class RagTokenizer:

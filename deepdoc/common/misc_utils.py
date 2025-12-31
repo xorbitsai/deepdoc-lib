@@ -14,19 +14,19 @@
 #  limitations under the License.
 #
 
-from ..depend.find_codec import find_codec
+import logging
 
+logger = logging.getLogger(__name__)
 
-def get_text(fnm: str, binary=None) -> str:
-    txt = ""
-    if binary:
-        encoding = find_codec(binary)
-        txt = binary.decode(encoding, errors="ignore")
-    else:
-        with open(fnm, "r") as f:
-            while True:
-                line = f.readline()
-                if not line:
-                    break
-                txt += line
-    return txt
+def pip_install_torch():
+    """
+    Install torch based on system configuration.
+    This is a simplified version for the independent library.
+    """
+    try:
+        import torch
+        logger.info("PyTorch is already installed")
+        return True
+    except ImportError:
+        logger.warning("PyTorch not found. Please install manually: pip install torch")
+        return False

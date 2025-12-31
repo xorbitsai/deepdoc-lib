@@ -18,7 +18,7 @@ from docx import Document
 import re
 import pandas as pd
 from collections import Counter
-from ..depend import rag_tokenizer
+from ..depend.rag_tokenizer import *
 from io import BytesIO
 
 
@@ -33,7 +33,7 @@ class RAGFlowDocxParser:
     def __compose_table_content(self, df):
 
         def blockType(b):
-            patt = [
+            pattern = [
                 ("^(20|19)[0-9]{2}[年/-][0-9]{1,2}[月/-][0-9]{1,2}日*$", "Dt"),
                 (r"^(20|19)[0-9]{2}年$", "Dt"),
                 (r"^(20|19)[0-9]{2}[年/-][0-9]{1,2}月*$", "Dt"),
@@ -47,7 +47,7 @@ class RAGFlowDocxParser:
                 (r"^[0-9.,+-]+[0-9A-Za-z/$￥%<>（）()' -]+$", "NE"),
                 (r"^.{1}$", "Sg")
             ]
-            for p, n in patt:
+            for p, n in pattern:
                 if re.search(p, b):
                     return n
             tks = [t for t in rag_tokenizer.tokenize(b).split() if len(t) > 1]
