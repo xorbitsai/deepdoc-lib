@@ -16,7 +16,7 @@
 #
 
 from ..depend.find_codec import find_codec
-from deepdoc.depend import rag_tokenizer
+from ..depend import rag_tokenizer
 import uuid
 import chardet
 from bs4 import BeautifulSoup, NavigableString, Tag, Comment

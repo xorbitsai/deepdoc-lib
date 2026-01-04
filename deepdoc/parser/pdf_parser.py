@@ -39,7 +39,7 @@ from sklearn.metrics import silhouette_score
 from ..common.file_utils import get_project_base_directory
 from ..common.misc_utils import pip_install_torch
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
-from deepdoc.depend import rag_tokenizer
+from ..depend import rag_tokenizer
 from ..depend.prompts import vision_llm_describe_prompt
 from ..common import settings
 
