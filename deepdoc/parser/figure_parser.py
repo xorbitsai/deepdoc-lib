@@ -17,8 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
-from .llm_adapter import LLMType, LLMAdapter
-from .llm_adapter.vision import vision_llm_chunk as picture_vision_llm_chunk
+from ..llm_adapter import LLMType, LLMAdapter
+from ..llm_adapter.vision import vision_llm_chunk as picture_vision_llm_chunk
 from ..depend.prompts import vision_llm_figure_describe_prompt
 
 # Try to import timeout from common, fallback to local
