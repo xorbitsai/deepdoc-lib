@@ -868,8 +868,21 @@ class RAGFlowPdfParser:
                 left, top, right, bott = b["x0"], b["top"], b["x1"], b["bottom"]
                 if right < left:
                     right = left + 1
+
+                # 确保裁剪坐标在图片边界内
+                img_width, img_height = self.page_images[pn].size
+                crop_left = max(0, int(left * ZM))
+                crop_top = max(0, int(top * ZM))
+                crop_right = min(img_width, max(crop_left + 1, int(right * ZM)))
+                crop_bottom = min(img_height, max(crop_top + 1, int(bott * ZM)))
+
                 poss.append((pn + self.page_from, left, right, top, bott))
-                return self.page_images[pn].crop((left * ZM, top * ZM, right * ZM, bott * ZM))
+
+                try:
+                    return self.page_images[pn].crop((crop_left, crop_top, crop_right, crop_bottom))
+                except Exception as e:
+                    logging.warning(f"Failed to crop image: {e}")
+                    return None
             pn = {}
             for b in bxs:
                 p = b["page_number"] - 1
@@ -889,20 +902,30 @@ class RAGFlowPdfParser:
         positions = []
         figure_results = []
         figure_positions = []
+        # counter for figures by page
+        figure_counter_by_page = {}
         # crop figure out and add caption
         for k, bxs in figures.items():
             txt = "\n".join([b["text"] for b in bxs])
+            # 如果文本为空，使用默认描述，但仍然处理图片
             if not txt:
-                continue
+                # 使用页码和序号生成唯一标识
+                page_num = bxs[0]["page_number"]
+                if page_num not in figure_counter_by_page:
+                    figure_counter_by_page[page_num] = 0
+                figure_counter_by_page[page_num] += 1
+                txt = f"Figure-P{page_num}-{figure_counter_by_page[page_num]}"
 
             poss = []
 
-            if separate_tables_figures:
-                figure_results.append((cropout(bxs, "figure", poss), [txt]))
-                figure_positions.append(poss)
-            else:
-                res.append((cropout(bxs, "figure", poss), [txt]))
-                positions.append(poss)
+            cropped_img = cropout(bxs, "figure", poss)
+            if cropped_img is not None:  # 只添加成功裁剪的图片
+                if separate_tables_figures:
+                    figure_results.append((cropped_img, [txt]))
+                    figure_positions.append(poss)
+                else:
+                    res.append((cropped_img, [txt]))
+                    positions.append(poss)
 
         for k, bxs in tables.items():
             if not bxs:
