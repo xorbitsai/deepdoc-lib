@@ -168,20 +168,32 @@ class DoclingParser(RAGFlowPdfParser):
 
         return (pic, positions) if need_position else pic
 
-    def _iter_doc_items(self, doc, has_bbox: bool = True) -> Iterable[tuple[str, Any, Optional[_BBox]]]:
+    def _iter_doc_items(self, doc, has_bbox: bool = True) -> Iterable[tuple[str, Any, Optional[_BBox], str]]:
         """
         Iterate over document items (texts, equations).
         
         Args:
             doc: Docling document object
             has_bbox: Whether the document format supports bbox (PDF=True, DOCX/PPTX=False)
+            
+        Yields:
+            Tuple of (content_type, text, bbox, label) where:
+            - content_type: DoclingContentType value
+            - text: Text content
+            - bbox: Bounding box (None for DOCX/PPTX)
+            - label: Docling label (e.g., "section_header", "text", "list_item", "FORMULA")
         """
         for t in getattr(doc, "texts", []):
             parent = getattr(t, "parent", "")
             ref = getattr(parent, "cref", "") if parent else ""
             label = getattr(t, "label", "")
-            if (label in ("section_header", "text",) and ref in ("#/body",)) or label in ("list_item",):
+            # Accept section_header, text, and list_item labels
+            # For DOCX/PPTX, ref may not be exactly "#/body" (could be "#/groups/0", "#/texts/0", etc.)
+            # So we accept any ref for these labels, or specifically check for "#/body" when needed
+            if label in ("section_header", "text", "list_item"):
                 text = getattr(t, "text", "") or ""
+                if not text.strip():
+                    continue
                 bbox = None
                 if has_bbox and getattr(t, "prov", None):
                     pn = getattr(t.prov[0], "page_no", None)
@@ -190,10 +202,11 @@ class DoclingParser(RAGFlowPdfParser):
                         bb = [getattr(bb, "l", None), getattr(bb, "t", None), getattr(bb, "r", None), getattr(bb, "b", None)]
                         if pn and bb and len(bb) == 4 and all(b is not None for b in bb):
                             bbox = _BBox(page_no=int(pn), x0=bb[0], y0=bb[1], x1=bb[2], y1=bb[3])
-                yield (DoclingContentType.TEXT.value, text, bbox)
+                yield (DoclingContentType.TEXT.value, text, bbox, label)
 
         for item in getattr(doc, "texts", []):
-            if getattr(item, "label", "") in ("FORMULA",):
+            item_label = getattr(item, "label", "")
+            if item_label in ("FORMULA",):
                 text = getattr(item, "text", "") or ""
                 bbox = None
                 if has_bbox and getattr(item, "prov", None):
@@ -203,7 +216,25 @@ class DoclingParser(RAGFlowPdfParser):
                         bb = [getattr(bb, "l", None), getattr(bb, "t", None), getattr(bb, "r", None), getattr(bb, "b", None)]
                         if pn and bb and len(bb) == 4 and all(b is not None for b in bb):
                             bbox = _BBox(int(pn), bb[0], bb[1], bb[2], bb[3])
-                yield (DoclingContentType.EQUATION.value, text, bbox)
+                yield (DoclingContentType.EQUATION.value, text, bbox, item_label)
+
+    def _label_to_style(self, label: str) -> str:
+        """
+        Map Docling label to Word style name.
+        
+        Args:
+            label: Docling label (e.g., "section_header", "text", "list_item")
+            
+        Returns:
+            Word-style name (e.g., "Heading", "Normal", "List Item")
+        """
+        label_to_style_map = {
+            "section_header": "Heading",
+            "text": "Normal",
+            "list_item": "List Item",
+            "FORMULA": "Equation",
+        }
+        return label_to_style_map.get(label, "Normal")
 
     def _transfer_to_sections(self, doc, parse_method: str, has_bbox: bool = True) -> list[tuple[str, str]]:
         """
@@ -213,9 +244,14 @@ class DoclingParser(RAGFlowPdfParser):
             doc: Docling document object
             parse_method: Parsing method ("raw", "manual", "paper")
             has_bbox: Whether the document format supports bbox
+            
+        Returns:
+            List of (text, tag_or_style) tuples where:
+            - For PDF (has_bbox=True): tag is position tag (e.g., "@@1\t0.0\t100.0\t0.0\t50.0##")
+            - For DOCX/PPTX (has_bbox=False): tag is style name (e.g., "Heading", "Normal")
         """
         sections: list[tuple[str, str]] = []
-        for typ, payload, bbox in self._iter_doc_items(doc, has_bbox=has_bbox):
+        for typ, payload, bbox, label in self._iter_doc_items(doc, has_bbox=has_bbox):
             if typ == DoclingContentType.TEXT.value:
                 section = payload.strip()
                 if not section:
@@ -225,7 +261,14 @@ class DoclingParser(RAGFlowPdfParser):
             else:
                 continue
             
-            tag = self._make_line_tag(bbox) if isinstance(bbox, _BBox) else ""
+            # For PDF (has_bbox=True): use position tag
+            # For DOCX/PPTX (has_bbox=False): use label as style
+            if isinstance(bbox, _BBox):
+                tag = self._make_line_tag(bbox)
+            else:
+                # No bbox, use label as style for DOCX/PPTX
+                tag = self._label_to_style(label)
+            
             if parse_method == "manual":
                 sections.append((section, typ, tag))
             elif parse_method == "paper":
