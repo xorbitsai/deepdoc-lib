@@ -25,6 +25,7 @@ __all__ = [
     "PdfParser",
     "PlainParser",
     "DocxParser",
+    "DoclingParser",
     "ExcelParser",
     "PptParser",
     "HtmlParser",
