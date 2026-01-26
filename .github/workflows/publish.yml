@@ -1,6 +1,19 @@
-name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
+name: Publish Python 🐍 distribution 📦 to GitHub Pages
 
-on: push
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -11,66 +24,73 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+        fetch-depth: 0
+    
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.x"
+    
     - name: Install pypa/build
-      run: >-
-        python3 -m
-        pip install
-        build
-        --user
+      run: |
+        python3 -m pip install build --user
+    
     - name: Build a binary wheel and a source tarball
       run: python3 -m build
+    
     - name: Store the distribution packages
       uses: actions/upload-artifact@v4
       with:
         name: python-package-distributions
         path: dist/
 
-  publish-to-pypi:
-    name: >-
-      Publish Python 🐍 distribution 📦 to PyPI
-    if: startsWith(github.ref, 'refs/tags/')  # only publish to PyPI on tag pushes
-    needs:
-    - build
+  publish-to-github-pages:
+    name: Publish 📦 to GitHub Pages
+    needs: build
     runs-on: ubuntu-latest
     environment:
-      name: pypi
-      url: https://pypi.org/p/deepdoc-lib
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
     - name: Download all the dists
       uses: actions/download-artifact@v4
       with:
         name: python-package-distributions
         path: dist/
-    - name: Publish distribution 📦 to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
 
-  publish-to-testpypi:
-    name: Publish Python 🐍 distribution 📦 to TestPyPI
-    needs:
-    - build
-    runs-on: ubuntu-latest
+    - name: Install dumb-pypi
+      run: pip install dumb-pypi
 
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/p/deepdoc-lib
+    - name: Create package index
+      run: |
+        # Put wheels in packages directory
+        mkdir -p index/packages
+        cp dist/*.whl index/packages/
+        
+        # Create package list
+        ls index/packages/*.whl | xargs -n 1 basename > package_list.txt
+        
+        # Generate index pointing to ../packages/
+        dumb-pypi \
+          --package-list package_list.txt \
+          --packages-url ../../packages/ \
+          --output-dir index \
+          --title "Deepdoc PyPI"
 
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+    - name: Setup Pages
+      uses: actions/configure-pages@v5
 
-    steps:
-    - name: Download all the dists
-      uses: actions/download-artifact@v4
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
       with:
-        name: python-package-distributions
-        path: dist/
-    - name: Publish distribution 📦 to TestPyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        repository-url: https://test.pypi.org/legacy/
+        path: 'index'
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4

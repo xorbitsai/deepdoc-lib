@@ -5,24 +5,25 @@
 - pip
 
     ``` bassh
-    pip install git+https://github.com/HuangPuStar/deepdoc-lib.git
+    pip install deepdoc-lib --extra-index-url https://huangpustar.github.io/deepdoc-lib/simple
     ```
 
 - pyproject
 
     Add the following to pyproject.toml
 
+    For uv:
+
     ```toml
+    [[tool.uv.index]]
+    name = "deepdoc"
+    url = "https://huangpustar.github.io/deepdoc-lib/simple"
+
+    [project]
     dependencies = [
-        # ... 
-        "deepdoc @ git+https://github.com/HuangPuStar/deepdoc-lib.git"
+        "deepdoc-lib",
     ]
     ```
-
-    And if you use uv
-
-    ``` sh
-    uv sync
     ```
 
 ### Parser Usage
