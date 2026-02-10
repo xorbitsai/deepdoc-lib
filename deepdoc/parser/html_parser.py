@@ -15,12 +15,15 @@
 #  limitations under the License.
 #
 
-from ..depend.find_codec import find_codec
-from ..depend import rag_tokenizer
+import html
 import uuid
+
 import chardet
 from bs4 import BeautifulSoup, NavigableString, Tag, Comment
-import html
+
+from ..config import TokenizerConfig
+from ..depend.find_codec import find_codec
+from ..depend.rag_tokenizer import RagTokenizer
 
 def get_encoding(file):
     with open(file,'rb') as f:
@@ -38,6 +41,14 @@ TITLE_TAGS = {"h1": "#", "h2": "##", "h3": "###", "h4": "#####", "h5": "#####", 
 
 
 class RAGFlowHtmlParser:
+    def __init__(self, tokenizer_cfg: TokenizerConfig):
+        self.tokenizer_cfg = tokenizer_cfg
+        self.tokenizer = RagTokenizer(
+            dict_prefix=tokenizer_cfg.resolve_dict_prefix(),
+            offline=tokenizer_cfg.offline,
+            nltk_data_dir=tokenizer_cfg.nltk_data_dir,
+        )
+
     def __call__(self, fnm, binary=None, chunk_token_num=512):
         if binary:
             encoding = find_codec(binary)
@@ -47,8 +58,7 @@ class RAGFlowHtmlParser:
                 txt = f.read()
         return self.parser_txt(txt, chunk_token_num)
 
-    @classmethod
-    def parser_txt(cls, txt, chunk_token_num):
+    def parser_txt(self, txt, chunk_token_num):
         if not isinstance(txt, str):
             raise TypeError("txt type should be string!")
 
@@ -69,15 +79,14 @@ class RAGFlowHtmlParser:
         for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
             comment.extract()
 
-        cls.read_text_recursively(soup.body, temp_sections, chunk_token_num=chunk_token_num)
-        block_txt_list, table_list = cls.merge_block_text(temp_sections)
-        sections = cls.chunk_block(block_txt_list, chunk_token_num=chunk_token_num)
+        self.read_text_recursively(soup.body, temp_sections, chunk_token_num=chunk_token_num)
+        block_txt_list, table_list = self.merge_block_text(temp_sections)
+        sections = self.chunk_block(block_txt_list, chunk_token_num=chunk_token_num)
         for table in table_list:
             sections.append(table.get("content", ""))
         return sections
 
-    @classmethod
-    def split_table(cls, html_table, chunk_token_num=512):
+    def split_table(self, html_table, chunk_token_num=512):
         soup = BeautifulSoup(html_table, "html.parser")
         rows = soup.find_all("tr")
         tables = []
@@ -85,7 +94,7 @@ class RAGFlowHtmlParser:
         current_count = 0
         table_str_list = []
         for row in rows:
-            tks_str = rag_tokenizer.tokenize(str(row))
+            tks_str = self.tokenizer.tokenize(str(row))
             token_count = len(tks_str.split(" ")) if tks_str else 0
             if current_count + token_count > chunk_token_num:
                 tables.append(current_table)
@@ -104,8 +113,7 @@ class RAGFlowHtmlParser:
 
         return table_str_list
 
-    @classmethod
-    def read_text_recursively(cls, element, parser_result, chunk_token_num=512, parent_name=None, block_id=None):
+    def read_text_recursively(self, element, parser_result, chunk_token_num=512, parent_name=None, block_id=None):
         if isinstance(element, NavigableString):
             content = element.strip()
 
@@ -120,7 +128,7 @@ class RAGFlowHtmlParser:
             if content:
                 if is_valid_html(content):
                     soup = BeautifulSoup(content, "html.parser")
-                    child_info = cls.read_text_recursively(soup, parser_result, chunk_token_num, element.name, block_id)
+                    child_info = self.read_text_recursively(soup, parser_result, chunk_token_num, element.name, block_id)
                     parser_result.extend(child_info)
                 else:
                     info = {"content": element.strip(), "tag_name": "inner_text", "metadata": {"block_id": block_id}}
@@ -142,13 +150,12 @@ class RAGFlowHtmlParser:
                 if str.lower(element.name) in BLOCK_TAGS:
                     block_id = str(uuid.uuid1())
                 for child in element.children:
-                    child_info = cls.read_text_recursively(child, parser_result, chunk_token_num, element.name,
+                    child_info = self.read_text_recursively(child, parser_result, chunk_token_num, element.name,
                                                            block_id)
                     parser_result.extend(child_info)
         return []
 
-    @classmethod
-    def merge_block_text(cls, parser_result):
+    def merge_block_text(self, parser_result):
         block_content = []
         current_content = ""
         table_info_list = []
@@ -177,14 +184,13 @@ class RAGFlowHtmlParser:
             block_content.append(current_content)
         return block_content, table_info_list
 
-    @classmethod
-    def chunk_block(cls, block_txt_list, chunk_token_num=512):
+    def chunk_block(self, block_txt_list, chunk_token_num=512):
         chunks = []
         current_block = ""
         current_token_count = 0
 
         for block in block_txt_list:
-            tks_str = rag_tokenizer.tokenize(block)
+            tks_str = self.tokenizer.tokenize(block)
             block_token_count = len(tks_str.split(" ")) if tks_str else 0
             if block_token_count > chunk_token_num:
                 if current_block:

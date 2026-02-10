@@ -30,3 +30,4 @@ def get_text(fnm: str, binary=None) -> str:
                     break
                 txt += line
     return txt
+

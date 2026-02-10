@@ -1,133 +1,118 @@
-import nltk
 import logging
+import os
 import threading
-from functools import lru_cache, wraps
-import ssl
-import warnings
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Thread-safe download lock
-_download_lock = threading.Lock()
-_downloaded_resources: set[str] = set()
+_RESOURCE_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "punkt",
+        (
+            "tokenizers/punkt",
+            "tokenizers/punkt.zip",
+            "tokenizers/punkt_tab",
+            "tokenizers/punkt_tab.zip",
+        ),
+    ),
+    ("wordnet", ("corpora/wordnet", "corpora/wordnet.zip")),
+    (
+        "averaged_perceptron_tagger",
+        (
+            "taggers/averaged_perceptron_tagger",
+            "taggers/averaged_perceptron_tagger.zip",
+            "taggers/averaged_perceptron_tagger_eng",
+            "taggers/averaged_perceptron_tagger_eng.zip",
+        ),
+    ),
+)
+
+_lock = threading.Lock()
+_ensured_keys: set[tuple[str, bool]] = set()
 
 
-def _setup_ssl_context():
-    """Setup SSL context for NLTK downloads."""
-    try:
-        _create_unverified_https_context = ssl._create_unverified_context
-    except AttributeError:
-        pass
-    else:
-        ssl._create_default_https_context = _create_unverified_https_context
+def _parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-@lru_cache(maxsize=None)
-def ensure_nltk_resource(resource_path: str, download_name: str) -> bool:
-    """
-    Ensure NLTK resource is available, download automatically if needed.
-    Thread-safe and cached.
-    """
-    # Fast path: check if already available
-    try:
-        nltk.data.find(resource_path)
-        return True
-    except LookupError:
-        pass
+def _resolve_nltk_data_dir(data_dir: str | None) -> Path | None:
+    configured = data_dir or os.getenv("DEEPDOC_NLTK_DATA_DIR")
+    if not configured:
+        return None
+    return Path(configured).expanduser().resolve()
 
-    # Slow path: download if needed (thread-safe)
-    with _download_lock:
-        # Double-check pattern
+
+def _ensure_search_path(nltk_module, data_path: Path | None):
+    if not data_path:
+        return
+    data_path.mkdir(parents=True, exist_ok=True)
+    text_path = str(data_path)
+    if text_path not in nltk_module.data.path:
+        nltk_module.data.path.insert(0, text_path)
+    os.environ["NLTK_DATA"] = text_path
+
+
+def _resource_exists(nltk_module, candidates: tuple[str, ...]) -> bool:
+    for resource_path in candidates:
         try:
-            nltk.data.find(resource_path)
+            nltk_module.data.find(resource_path)
             return True
         except LookupError:
-            pass
-
-        # Avoid re-downloading if we already tried
-        if download_name in _downloaded_resources:
-            return False
-
-        try:
-            logger.info(f"Downloading NLTK resource: {download_name}")
-            _setup_ssl_context()
-
-            # Suppress NLTK download messages unless in debug mode
-            with warnings.catch_warnings():
-                if logger.getEffectiveLevel() > logging.DEBUG:
-                    warnings.simplefilter("ignore")
-
-                success = nltk.download(download_name, quiet=True)
-
-            _downloaded_resources.add(download_name)
-
-            if success:
-                logger.debug(f"Successfully downloaded {download_name}")
-                return True
-            else:
-                logger.warning(f"Failed to download {download_name}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error downloading {download_name}: {e}")
-            _downloaded_resources.add(download_name)  # Don't retry
-            return False
+            continue
+        except Exception as exc:
+            logger.warning("NLTK resource check failed for %s: %s", resource_path, exc)
+            continue
+    return False
 
 
-def require_nltk_data(*resources):
-    """
-    Decorator that ensures NLTK resources are available.
-    Works with functions, methods, and classes.
+def ensure_nltk_data(
+    *,
+    data_dir: str | None = None,
+    offline: bool | None = None,
+) -> None:
+    """Ensure required NLTK resources are available for tokenizer usage."""
 
-    Args:
-        *resources: Tuples of (resource_path, download_name)
-    """
+    import nltk
 
-    def decorator(target):
-        # Handle class decoration
-        if isinstance(target, type):
-            # Decorate the class
-            original_init = target.__init__
+    resolved_dir = _resolve_nltk_data_dir(data_dir)
+    offline_mode = offline if offline is not None else _parse_bool(os.getenv("DEEPDOC_OFFLINE"), default=False)
+    auto_download_mode = not offline_mode
 
-            @wraps(original_init)
-            def new_init(self, *args, **kwargs):
-                # Ensure resources before class initialization
-                missing = []
-                for resource_path, download_name in resources:
-                    if not ensure_nltk_resource(resource_path, download_name):
-                        missing.append(download_name)
+    _ensure_search_path(nltk, resolved_dir)
+    cache_key = (str(resolved_dir) if resolved_dir else "", offline_mode)
 
-                if missing:
-                    raise RuntimeError(
-                        f"Failed to download required NLTK resources: {', '.join(missing)}. "
-                        f"Please check your internet connection or install manually: "
-                        f"python -c \"import nltk; [nltk.download('{r}') for r in {missing}]\""
-                    )
+    with _lock:
+        if cache_key in _ensured_keys:
+            return
 
-                return original_init(self, *args, **kwargs)
+        missing_packages: list[str] = []
+        for package, candidates in _RESOURCE_SPECS:
+            if not _resource_exists(nltk, candidates):
+                missing_packages.append(package)
 
-            target.__init__ = new_init
-            return target
+        if missing_packages and auto_download_mode:
+            download_dir = str(resolved_dir) if resolved_dir else None
+            for package in list(missing_packages):
+                try:
+                    success = nltk.download(package, quiet=True, download_dir=download_dir)
+                except Exception as exc:
+                    logger.warning("Failed to download NLTK package %s: %s", package, exc)
+                    success = False
+                if success and _resource_exists(nltk, dict(_RESOURCE_SPECS)[package]):
+                    missing_packages.remove(package)
 
-        # Handle function/method decoration
-        else:
+        if missing_packages:
+            searched_paths = ", ".join(nltk.data.path)
+            raise RuntimeError(
+                "Missing required NLTK packages: {}. Searched paths: {}. "
+                "Set DEEPDOC_NLTK_DATA_DIR to a local NLTK data path, or disable offline mode by setting "
+                "DEEPDOC_OFFLINE=0."
+                .format(
+                    ", ".join(missing_packages),
+                    searched_paths,
+                )
+            )
 
-            @wraps(target)
-            def wrapper(*args, **kwargs):
-                missing = []
-                for resource_path, download_name in resources:
-                    if not ensure_nltk_resource(resource_path, download_name):
-                        missing.append(download_name)
-
-                if missing:
-                    raise RuntimeError(
-                        f"Failed to download required NLTK resources: {', '.join(missing)}. "
-                        f"Please check your internet connection or install manually: "
-                        f"python -c \"import nltk; [nltk.download('{r}') for r in {missing}]\""
-                    )
-
-                return target(*args, **kwargs)
-
-            return wrapper
-
-    return decorator
+        _ensured_keys.add(cache_key)

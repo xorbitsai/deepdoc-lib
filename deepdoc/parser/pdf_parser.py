@@ -30,16 +30,15 @@ from timeit import default_timer as timer
 import numpy as np
 import pdfplumber
 import xgboost as xgb
-from huggingface_hub import snapshot_download
 from PIL import Image
 from pypdf import PdfReader as pdf2_read
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from ..common.file_utils import get_project_base_directory
 from ..common.misc_utils import pip_install_torch
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
-from ..depend import rag_tokenizer
+from ..config import PdfModelConfig, TokenizerConfig
+from ..depend.rag_tokenizer import RagTokenizer, is_chinese
 from ..depend.prompts import vision_llm_describe_prompt
 from ..common import settings
 
@@ -49,20 +48,28 @@ if LOCK_KEY_pdfplumber not in sys.modules:
 
 
 class RAGFlowPdfParser:
-    def __init__(self, **kwargs):
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
+    def __init__(self, model_cfg: PdfModelConfig, tokenizer_cfg: TokenizerConfig):
+        self.model_cfg = model_cfg
+        self.tokenizer_cfg = tokenizer_cfg
 
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
+        provider = model_cfg.normalized_provider()
+        model_offline = provider == "local"
+        self.tokenizer = RagTokenizer(
+            dict_prefix=tokenizer_cfg.resolve_dict_prefix(),
+            offline=tokenizer_cfg.offline,
+            nltk_data_dir=tokenizer_cfg.nltk_data_dir,
+        )
 
-        For Windows:
-        Good luck
-        ^_-
+        vision_model_dir = model_cfg.resolve_vision_model_dir()
+        xgb_model_dir = model_cfg.resolve_xgb_model_dir()
+        ascend_model_dir = model_cfg.resolve_ascend_model_dir()
 
-        """
-
-        self.ocr = OCR()
+        self.ocr = OCR(
+            model_dir=vision_model_dir,
+            model_home=model_cfg.model_home,
+            model_provider=provider,
+            offline=model_offline,
+        )
         self.parallel_limiter = None
         if settings.PARALLEL_DEVICES > 1:
             self.parallel_limiter = [asyncio.Semaphore(1) for _ in range(settings.PARALLEL_DEVICES)]
@@ -78,11 +85,24 @@ class RAGFlowPdfParser:
 
         if layout_recognizer_type == "ascend":
             logging.debug("Using Ascend LayoutRecognizer")
-            self.layouter = AscendLayoutRecognizer(recognizer_domain)
+            if not ascend_model_dir:
+                raise ValueError("ascend_model_dir is required when LAYOUT_RECOGNIZER_TYPE=ascend")
+            self.layouter = AscendLayoutRecognizer(recognizer_domain, model_dir=ascend_model_dir)
         else:  # onnx
             logging.debug("Using Onnx LayoutRecognizer")
-            self.layouter = LayoutRecognizer(recognizer_domain)
-        self.tbl_det = TableStructureRecognizer()
+            self.layouter = LayoutRecognizer(
+                recognizer_domain,
+                model_dir=vision_model_dir,
+                model_home=model_cfg.model_home,
+                model_provider=provider,
+                offline=model_offline,
+            )
+        self.tbl_det = TableStructureRecognizer(
+            model_dir=vision_model_dir,
+            model_home=model_cfg.model_home,
+            model_provider=provider,
+            offline=model_offline,
+        )
 
         self.updown_cnt_mdl = xgb.Booster()
         try:
@@ -92,12 +112,8 @@ class RAGFlowPdfParser:
                 self.updown_cnt_mdl.set_param({"device": "cuda"})
         except Exception:
             logging.info("No torch found.")
-        try:
-            model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
-            self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
-        except Exception:
-            model_dir = snapshot_download(repo_id="InfiniFlow/text_concat_xgb_v1.0", local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"), local_dir_use_symlinks=False)
-            self.updown_cnt_mdl.load_model(os.path.join(model_dir, "updown_concat_xgb.model"))
+
+        self.updown_cnt_mdl.load_model(os.path.join(xgb_model_dir, "updown_concat_xgb.model"))
 
         self.page_from = 0
         self.column_num = 1
@@ -132,10 +148,10 @@ class RAGFlowPdfParser:
         h = max(self.__height(up), self.__height(down))
         y_dis = self._y_dis(up, down)
         LEN = 6
-        tks_down = rag_tokenizer.tokenize(down["text"][:LEN]).split()
-        tks_up = rag_tokenizer.tokenize(up["text"][-LEN:]).split()
+        tks_down = self.tokenizer.tokenize(down["text"][:LEN]).split()
+        tks_up = self.tokenizer.tokenize(up["text"][-LEN:]).split()
         tks_all = up["text"][-LEN:].strip() + (" " if re.match(r"[a-zA-Z0-9]+", up["text"][-1] + down["text"][0]) else "") + down["text"][:LEN].strip()
-        tks_all = rag_tokenizer.tokenize(tks_all).split()
+        tks_all = self.tokenizer.tokenize(tks_all).split()
         fea = [
             up.get("R", -1) == down.get("R", -1),
             y_dis / h,
@@ -167,8 +183,8 @@ class RAGFlowPdfParser:
             tks_down[-1] == tks_up[-1] if tks_down and tks_up else False,
             max(down["in_row"], up["in_row"]),
             abs(down["in_row"] - up["in_row"]),
-            len(tks_down) == 1 and rag_tokenizer.tag(tks_down[0]).find("n") >= 0,
-            len(tks_up) == 1 and rag_tokenizer.tag(tks_up[0]).find("n") >= 0,
+            len(tks_down) == 1 and self.tokenizer.tag(tks_down[0]).find("n") >= 0,
+            len(tks_up) == 1 and self.tokenizer.tag(tks_up[0]).find("n") >= 0,
         ]
         return fea
 
@@ -741,7 +757,7 @@ class RAGFlowPdfParser:
             if (
                 b["text"].strip()[0] != b_["text"].strip()[0]
                 or b["text"].strip()[0].lower() in set("qwertyuopasdfghjklzxcvbnm")
-                or rag_tokenizer.is_chinese(b["text"].strip()[0])
+                or is_chinese(b["text"].strip()[0])
                 or b["top"] > b_["bottom"]
             ):
                 i += 1
@@ -1433,6 +1449,9 @@ class RAGFlowPdfParser:
 
 
 class PlainParser:
+    def __init__(self):
+        pass
+
     def __call__(self, filename, from_page=0, to_page=100000, **kwargs):
         self.outlines = []
         lines = []
@@ -1467,10 +1486,11 @@ class PlainParser:
 
 
 class VisionParser(RAGFlowPdfParser):
-    def __init__(self, vision_model, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, vision_model, model_cfg: PdfModelConfig, tokenizer_cfg: TokenizerConfig):
+        super().__init__(model_cfg=model_cfg, tokenizer_cfg=tokenizer_cfg)
         self.vision_model = vision_model
         self.outlines = []
+
 
     def __images__(self, fnm, zoomin=3, page_from=0, page_to=299, callback=None):
         try:

@@ -37,6 +37,7 @@ from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentClo
 from tencentcloud.lkeap.v20240522 import lkeap_client, models
 
 from ..common.config_utils import get_base_config
+from deepdoc.config import PdfModelConfig, TokenizerConfig
 from deepdoc.parser.pdf_parser import RAGFlowPdfParser
 
 
@@ -192,9 +193,17 @@ class TencentCloudAPIClient:
 
 
 class TCADPParser(RAGFlowPdfParser):
-    def __init__(self, secret_id: str = None, secret_key: str = None, region: str = "ap-guangzhou", 
-                 table_result_type: str = None, markdown_image_response_type: str = None):
-        super().__init__()
+    def __init__(
+        self,
+        model_cfg: PdfModelConfig,
+        tokenizer_cfg: TokenizerConfig,
+        secret_id: str = None,
+        secret_key: str = None,
+        region: str = "ap-guangzhou",
+        table_result_type: str = None,
+        markdown_image_response_type: str = None,
+    ):
+        super().__init__(model_cfg=model_cfg, tokenizer_cfg=tokenizer_cfg)
         
         # First initialize logger
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -514,7 +523,9 @@ class TCADPParser(RAGFlowPdfParser):
 
 if __name__ == "__main__":
     # Test ADP parser
-    parser = TCADPParser()
+    model_cfg = PdfModelConfig.from_env()
+    tokenizer_cfg = TokenizerConfig.from_env()
+    parser = TCADPParser(model_cfg=model_cfg, tokenizer_cfg=tokenizer_cfg)
     print("ADP available:", parser.check_installation())
 
     # Test parsing

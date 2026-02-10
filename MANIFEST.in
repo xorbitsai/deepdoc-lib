@@ -11,10 +11,9 @@ recursive-include deepdoc *.json
 recursive-include deepdoc *.yaml
 recursive-include deepdoc *.yml
 recursive-include deepdoc *.csv
-recursive-include deepdoc *.onnx
-recursive-include deepdoc *.model
-recursive-include deepdoc *.res
-recursive-include deepdoc *.trie
+
+# Exclude heavyweight model artifacts (resolved at runtime)
+prune deepdoc/rag/res
 
 # Exclude unwanted files
 global-exclude *.pyc

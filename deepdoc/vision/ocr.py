@@ -19,9 +19,7 @@ import copy
 import time
 import os
 
-from huggingface_hub import snapshot_download
-
-from ..common.file_utils import get_project_base_directory
+from ..common.model_store import resolve_vision_model_dir
 from ..common.misc_utils import pip_install_torch
 from ..common import settings
 from .operators import *  # noqa: F403
@@ -534,49 +532,30 @@ class TextDetector:
 
 
 class OCR:
-    def __init__(self, model_dir=None):
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
-
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
-
-        For Windows:
-        Good luck
-        ^_-
-
-        """
+    def __init__(
+        self,
+        model_dir=None,
+        model_home: str | None = None,
+        model_provider: str | None = None,
+        offline: bool | None = None,
+    ):
         if not model_dir:
-            try:
-                model_dir = os.path.join(
-                        get_project_base_directory(),
-                        "rag/res/deepdoc")
-                
-                # Append muti-gpus task to the list
-                if settings.PARALLEL_DEVICES > 0:
-                    self.text_detector = []
-                    self.text_recognizer = []
-                    for device_id in range(settings.PARALLEL_DEVICES):
-                        self.text_detector.append(TextDetector(model_dir, device_id))
-                        self.text_recognizer.append(TextRecognizer(model_dir, device_id))
-                else:
-                    self.text_detector = [TextDetector(model_dir)]
-                    self.text_recognizer = [TextRecognizer(model_dir)]
+            model_dir = resolve_vision_model_dir(
+                model_home=model_home,
+                provider=model_provider,
+                offline=offline,
+            )
 
-            except Exception:
-                model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
-                                              local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
-                                              local_dir_use_symlinks=False)
-                
-                if settings.PARALLEL_DEVICES > 0:
-                    self.text_detector = []
-                    self.text_recognizer = []
-                    for device_id in range(settings.PARALLEL_DEVICES):
-                        self.text_detector.append(TextDetector(model_dir, device_id))
-                        self.text_recognizer.append(TextRecognizer(model_dir, device_id))
-                else:
-                    self.text_detector = [TextDetector(model_dir)]
-                    self.text_recognizer = [TextRecognizer(model_dir)]
+        # Append multi-GPU tasks to the list
+        if settings.PARALLEL_DEVICES > 0:
+            self.text_detector = []
+            self.text_recognizer = []
+            for device_id in range(settings.PARALLEL_DEVICES):
+                self.text_detector.append(TextDetector(model_dir, device_id))
+                self.text_recognizer.append(TextRecognizer(model_dir, device_id))
+        else:
+            self.text_detector = [TextDetector(model_dir)]
+            self.text_recognizer = [TextRecognizer(model_dir)]
 
         self.drop_score = 0.5
         self.crop_image_res_index = 0

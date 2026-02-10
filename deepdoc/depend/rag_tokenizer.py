@@ -14,52 +14,21 @@
 #  limitations under the License.
 #
 
+import copy
+import logging
 import math
 import os
 import re
 import string
 import sys
-import logging
-from hanziconv import HanziConv
+import threading
+
 import datrie
-import copy
-
-
-def ensure_nltk_data():
-    """确保 NLTK 数据已下载"""
-    import nltk
-    
-    # 需要检查的 NLTK 数据包
-    required_packages = ['punkt', 'wordnet', 'averaged_perceptron_tagger']
-    
-    for package in required_packages:
-        try:
-            # 尝试导入数据包
-            if package == 'punkt':
-                nltk.data.find('tokenizers/punkt')
-            elif package == 'wordnet':
-                nltk.data.find('corpora/wordnet')
-            elif package == 'averaged_perceptron_tagger':
-                nltk.data.find('taggers/averaged_perceptron_tagger')
-        except LookupError:
-            # 数据包不存在，尝试下载
-            try:
-                logging.info(f"Downloading NLTK package: {package}")
-                nltk.download(package, quiet=True)
-                logging.info(f"Successfully downloaded NLTK package: {package}")
-            except Exception as e:
-                logging.warning(f"Failed to download NLTK package {package}: {e}")
-                # 继续执行，不中断程序
-        except Exception as e:
-            logging.warning(f"Error checking NLTK package {package}: {e}")
-
-# 确保 NLTK 数据可用
-ensure_nltk_data()
-
-# 然后正常导入 NLTK
-from nltk import word_tokenize
+from hanziconv import HanziConv
 from nltk.stem import PorterStemmer, WordNetLemmatizer
-from ..common.file_utils import get_project_base_directory
+
+from ..common.model_store import resolve_tokenizer_dict_prefix
+from .nltk_manager import ensure_nltk_data
 
 
 class RagTokenizer:
@@ -92,10 +61,31 @@ class RagTokenizer:
         except Exception:
             logging.exception(f"[HUQIE]:Build trie {fnm} failed")
 
-    def __init__(self, debug=False):
+    def __init__(
+        self,
+        debug=False,
+        dict_prefix: str | None = None,
+        model_home: str | None = None,
+        model_provider: str | None = None,
+        offline: bool | None = None,
+        nltk_data_dir: str | None = None,
+    ):
         self.DEBUG = debug
         self.DENOMINATOR = 1000000
-        self.DIR_ = os.path.join(get_project_base_directory(), "dict", "huqie")
+
+        ensure_nltk_data(
+            data_dir=nltk_data_dir,
+            offline=offline,
+        )
+
+        from nltk import word_tokenize
+
+        self.word_tokenize = word_tokenize
+        self.DIR_ = dict_prefix or resolve_tokenizer_dict_prefix(
+            model_home=model_home,
+            provider=model_provider,
+            offline=offline,
+        )
 
         self.stemmer = PorterStemmer()
         self.lemmatizer = WordNetLemmatizer()
@@ -362,7 +352,7 @@ class RagTokenizer:
         res = []
         for L,lang in arr:
             if not lang:
-                res.extend([self.stemmer.stem(self.lemmatizer.lemmatize(t)) for t in word_tokenize(L)])
+                res.extend([self.stemmer.stem(self.lemmatizer.lemmatize(t)) for t in self.word_tokenize(L)])
                 continue
             if len(L) < 2 or re.match(
                     r"[a-z\.-]+$", L) or re.match(r"[0-9\.-]+$", L):
@@ -498,15 +488,53 @@ def naiveQie(txt):
     return tks
 
 
-rag_tokenizer = RagTokenizer()
-tokenize = rag_tokenizer.tokenize
-fine_grained_tokenize = rag_tokenizer.fine_grained_tokenize
-tag = rag_tokenizer.tag
-freq = rag_tokenizer.freq
-loadUserDict = rag_tokenizer.loadUserDict
-addUserDict = rag_tokenizer.addUserDict
-tradi2simp = rag_tokenizer._tradi2simp
-strQ2B = rag_tokenizer._strQ2B
+_default_tokenizer_lock = threading.Lock()
+_default_tokenizer: RagTokenizer | None = None
+
+
+def get_default_tokenizer() -> RagTokenizer:
+    global _default_tokenizer
+
+    if _default_tokenizer is not None:
+        return _default_tokenizer
+
+    with _default_tokenizer_lock:
+        if _default_tokenizer is None:
+            _default_tokenizer = RagTokenizer()
+        return _default_tokenizer
+
+
+def tokenize(line):
+    return get_default_tokenizer().tokenize(line)
+
+
+def fine_grained_tokenize(tks):
+    return get_default_tokenizer().fine_grained_tokenize(tks)
+
+
+def tag(tk):
+    return get_default_tokenizer().tag(tk)
+
+
+def freq(tk):
+    return get_default_tokenizer().freq(tk)
+
+
+def loadUserDict(fnm):
+    return get_default_tokenizer().loadUserDict(fnm)
+
+
+def addUserDict(fnm):
+    return get_default_tokenizer().addUserDict(fnm)
+
+
+def tradi2simp(line):
+    return get_default_tokenizer()._tradi2simp(line)
+
+
+def strQ2B(line):
+    return get_default_tokenizer()._strQ2B(line)
+
 
 if __name__ == '__main__':
     tknzr = RagTokenizer(debug=True)
