@@ -13,7 +13,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-import gc
 import logging
 import math
 import numpy as np
@@ -405,10 +404,20 @@ class Recognizer:
         } for i in indices]
 
     def close(self):
-        logging.info("Close recognizer.")
+        # NOTE: `__del__` can run during interpreter shutdown when module
+        # globals (including `logging`/`gc`) may already be cleared to None.
+        try:
+            import logging as _logging
+            _logging.info("Close recognizer.")
+        except Exception:
+            pass
         if hasattr(self, "ort_sess"):
             del self.ort_sess
-        gc.collect()
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
 
     def __call__(self, image_list, thr=0.7, batch_size=16):
         res = []
@@ -435,6 +444,8 @@ class Recognizer:
         return res
 
     def __del__(self):
-        self.close()
-
-
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never raise.
+            pass

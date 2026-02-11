@@ -13,7 +13,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-import gc
 import logging
 import copy
 import time
@@ -353,10 +352,20 @@ class TextRecognizer:
 
     def close(self):
         # close session and release manually
-        logging.info('Close text recognizer.')
+        # NOTE: `__del__` can run during interpreter shutdown when module
+        # globals (including `logging`/`gc`) may already be cleared to None.
+        try:
+            import logging as _logging
+            _logging.info("Close text recognizer.")
+        except Exception:
+            pass
         if hasattr(self, "predictor"):
             del self.predictor
-        gc.collect()
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
 
     def __call__(self, img_list):
         img_num = len(img_list)
@@ -406,7 +415,11 @@ class TextRecognizer:
         return rec_res, time.time() - st
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never raise.
+            pass
 
 
 class TextDetector:
@@ -493,10 +506,20 @@ class TextDetector:
         return dt_boxes
 
     def close(self):
-        logging.info("Close text detector.")
+        # NOTE: `__del__` can run during interpreter shutdown when module
+        # globals (including `logging`/`gc`) may already be cleared to None.
+        try:
+            import logging as _logging
+            _logging.info("Close text detector.")
+        except Exception:
+            pass
         if hasattr(self, "predictor"):
             del self.predictor
-        gc.collect()
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
 
     def __call__(self, img):
         ori_im = img.copy()
@@ -528,7 +551,11 @@ class TextDetector:
         return dt_boxes, time.time() - st
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never raise.
+            pass
 
 
 class OCR:
