@@ -2,29 +2,24 @@
 
 ### Installations
 
-- pip
+CPU-only (default):
 
-    ``` bassh
-    pip install deepdoc-lib --extra-index-url https://huangpustar.github.io/deepdoc-lib/simple
-    ```
+```bash
+pip install git+https://github.com/xorbitsai/deepdoc-lib
+```
 
-- pyproject
+GPU (Linux x86_64 only):
 
-    Add the following to pyproject.toml
+```bash
+pip install "deepdoc-lib[gpu] @ git+https://github.com/xorbitsai/deepdoc-lib"
+```
 
-    For uv:
+Note: `onnxruntime` (CPU) and `onnxruntime-gpu` should not be installed together. If you're switching an existing environment to GPU, uninstall CPU ORT first:
 
-    ```toml
-    [[tool.uv.index]]
-    name = "deepdoc"
-    url = "https://huangpustar.github.io/deepdoc-lib/simple"
-
-    [project]
-    dependencies = [
-        "deepdoc-lib",
-    ]
-    ```
-    ```
+```bash
+pip uninstall -y onnxruntime
+pip install onnxruntime-gpu==1.19.2
+```
 
 ### Parser Usage
 

@@ -18,6 +18,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 def pip_install_torch():
     """
     Install torch based on system configuration.
@@ -25,8 +26,8 @@ def pip_install_torch():
     """
     try:
         import torch
+
         logger.info("PyTorch is already installed")
         return True
     except ImportError:
-        logger.warning("PyTorch not found. Please install manually: pip install torch")
         return False
