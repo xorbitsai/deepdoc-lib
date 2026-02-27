@@ -18,6 +18,7 @@ import asyncio
 import logging
 import math
 import os
+import queue
 import random
 import re
 import sys
@@ -1185,7 +1186,35 @@ class RAGFlowPdfParser:
 
         start = timer()
 
-        asyncio.run(__img_ocr_launcher())
+        # Handle asyncio.run() in case there's already a running event loop
+        try:
+            # Check if there's a running event loop
+            asyncio.get_running_loop()
+            # If we get here, there's a running loop, so we need to run in a new thread
+            result_queue: queue.Queue = queue.Queue()
+
+            def runner():
+                try:
+                    # Create a new event loop in this thread
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    try:
+                        result_queue.put((True, new_loop.run_until_complete(__img_ocr_launcher())))
+                    finally:
+                        new_loop.close()
+                except Exception as e:
+                    result_queue.put((False, e))
+
+            thread = threading.Thread(target=runner, daemon=True)
+            thread.start()
+            thread.join()
+
+            success, value = result_queue.get_nowait()
+            if not success:
+                raise value
+        except RuntimeError:
+            # No running event loop, safe to use asyncio.run()
+            asyncio.run(__img_ocr_launcher())
 
         logging.info(f"__images__ {len(self.page_images)} pages cost {timer() - start}s")
 
