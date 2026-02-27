@@ -45,9 +45,7 @@ def _normalize_provider(provider: str | None) -> str:
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in {"auto", "local", "modelscope"}:
-        raise ValueError(
-            "Unsupported model provider '{}'. Use one of: auto, local, modelscope.".format(normalized)
-        )
+        raise ValueError("Unsupported model provider '{}'. Use one of: auto, local, modelscope.".format(normalized))
     return normalized
 
 
@@ -195,20 +193,14 @@ def _import_modelscope_snapshot_download():
 
             return snapshot_download
         except Exception as exc:  # pragma: no cover - import behavior depends on runtime env
-            raise RuntimeError(
-                "ModelScope provider requires the 'modelscope' package. "
-                "Install it or switch DEEPDOC_MODEL_PROVIDER=local."
-            ) from exc
+            raise RuntimeError("ModelScope provider requires the 'modelscope' package. Install it or switch DEEPDOC_MODEL_PROVIDER=local.") from exc
 
 
 def _download_modelscope_repo(*, repo_id: str, revision: str, target_dir: Path, offline: bool) -> Path:
     snapshot_download = _import_modelscope_snapshot_download()
 
     if not repo_id:
-        raise RuntimeError(
-            "ModelScope repo id is empty. "
-            f"Set {GLOBAL_MODELSCOPE_REPO_ENV} or a bundle-specific env like DEEPDOC_MODELSCOPE_VISION_REPO."
-        )
+        raise RuntimeError(f"ModelScope repo id is empty. Set {GLOBAL_MODELSCOPE_REPO_ENV} or a bundle-specific env like DEEPDOC_MODELSCOPE_VISION_REPO.")
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -270,29 +262,43 @@ def resolve_bundle_dir(
 
     roots_to_scan = [local_bundle_dir]
 
-    if provider_name in {"auto", "local"}:
-        discovered = _discover_bundle_dir(spec, roots_to_scan)
-        if discovered:
-            return str(discovered)
+    # Prefer reusing already-downloaded ModelScope artifacts from our stable
+    # `model_home/modelscope/<repo>/<revision>/...` location when using shared repos.
+    shared_download_dir: Path | None = None
+    shared_repo_id: str | None = None
+    shared_revision: str | None = None
+    use_shared_repo_dir = False
+    if provider_name in {"auto", "modelscope"} and not offline_mode:
+        shared_repo_id, use_shared_repo_dir = _resolve_modelscope_repo_id(spec)
+        if use_shared_repo_dir:
+            shared_revision = _resolve_modelscope_revision(spec)
+            shared_download_dir = _modelscope_shared_download_dir(model_home, shared_repo_id, shared_revision)
+            roots_to_scan.append(shared_download_dir)
 
-        if provider_name == "local":
-            _, missing = _validate_bundle_dir(spec, local_bundle_dir)
-            raise FileNotFoundError(
-                "Missing required files for local '{}' bundle under {}: {}. "
-                "Set {} or DEEPDOC_MODEL_HOME to a directory containing these files."
-                .format(spec.name, local_bundle_dir, ", ".join(missing), spec.local_dir_env)
-            )
+    discovered = _discover_bundle_dir(spec, roots_to_scan)
+    if discovered:
+        return str(discovered)
 
-    if provider_name == "local" or offline_mode:
+    if provider_name == "local":
+        _, missing = _validate_bundle_dir(spec, local_bundle_dir)
         raise FileNotFoundError(
-            "Bundle '{}' was not found locally at {} and remote download is disabled. "
-            "Disable DEEPDOC_OFFLINE or provide local model files."
-            .format(spec.name, local_bundle_dir)
+            "Missing required files for local '{}' bundle under {}: {}. Set {} or DEEPDOC_MODEL_HOME to a directory containing these files.".format(
+                spec.name, local_bundle_dir, ", ".join(missing), spec.local_dir_env
+            )
         )
 
-    repo_id, use_shared_repo_dir = _resolve_modelscope_repo_id(spec)
-    revision = _resolve_modelscope_revision(spec)
-    download_dir = _modelscope_shared_download_dir(model_home, repo_id, revision) if use_shared_repo_dir else local_bundle_dir
+    if provider_name == "local" or offline_mode:
+        raise FileNotFoundError("Bundle '{}' was not found locally at {} and remote download is disabled. Disable DEEPDOC_OFFLINE or provide local model files.".format(spec.name, local_bundle_dir))
+
+    repo_id = shared_repo_id
+    revision = shared_revision
+    if not repo_id or revision is None or not use_shared_repo_dir:
+        repo_id, use_shared_repo_dir = _resolve_modelscope_repo_id(spec)
+        revision = _resolve_modelscope_revision(spec)
+        download_dir = _modelscope_shared_download_dir(model_home, repo_id, revision) if use_shared_repo_dir else local_bundle_dir
+    else:
+        # We already computed the shared repo download dir above.
+        download_dir = shared_download_dir or _modelscope_shared_download_dir(model_home, repo_id, revision)
 
     snapshot_root = _download_modelscope_repo(
         repo_id=repo_id,
@@ -308,8 +314,7 @@ def resolve_bundle_dir(
         "Downloaded ModelScope repo '{}@{}' for bundle '{}' but could not locate the required files. "
         "Expected the following files to be colocated under a single directory in the repo (e.g. '{}/'): {}. "
         "Configured via {} / {} and {} / {}. "
-        "Searched under: {}, {}."
-        .format(
+        "Searched under: {}, {}.".format(
             repo_id,
             revision,
             spec.name,

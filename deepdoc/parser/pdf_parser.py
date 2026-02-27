@@ -48,7 +48,19 @@ if LOCK_KEY_pdfplumber not in sys.modules:
 
 
 class RAGFlowPdfParser:
-    def __init__(self, model_cfg: PdfModelConfig, tokenizer_cfg: TokenizerConfig):
+    def __init__(
+        self,
+        model_cfg: PdfModelConfig | None = None,
+        tokenizer_cfg: TokenizerConfig | None = None,
+    ):
+        # Allow constructing parsers without explicitly passing configs.
+        # Env-based factories keep backwards compatibility for users that already
+        # configure via DEEPDOC_* env vars.
+        if model_cfg is None:
+            model_cfg = PdfModelConfig.from_env()
+        if tokenizer_cfg is None:
+            tokenizer_cfg = TokenizerConfig.from_env()
+
         self.model_cfg = model_cfg
         self.tokenizer_cfg = tokenizer_cfg
 
@@ -1486,7 +1498,12 @@ class PlainParser:
 
 
 class VisionParser(RAGFlowPdfParser):
-    def __init__(self, vision_model, model_cfg: PdfModelConfig, tokenizer_cfg: TokenizerConfig):
+    def __init__(
+        self,
+        vision_model,
+        model_cfg: PdfModelConfig | None = None,
+        tokenizer_cfg: TokenizerConfig | None = None,
+    ):
         super().__init__(model_cfg=model_cfg, tokenizer_cfg=tokenizer_cfg)
         self.vision_model = vision_model
         self.outlines = []

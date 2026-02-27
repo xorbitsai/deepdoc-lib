@@ -41,7 +41,9 @@ TITLE_TAGS = {"h1": "#", "h2": "##", "h3": "###", "h4": "#####", "h5": "#####", 
 
 
 class RAGFlowHtmlParser:
-    def __init__(self, tokenizer_cfg: TokenizerConfig):
+    def __init__(self, tokenizer_cfg: TokenizerConfig | None = None):
+        if tokenizer_cfg is None:
+            tokenizer_cfg = TokenizerConfig.from_env()
         self.tokenizer_cfg = tokenizer_cfg
         self.tokenizer = RagTokenizer(
             dict_prefix=tokenizer_cfg.resolve_dict_prefix(),
@@ -217,4 +219,3 @@ class RAGFlowHtmlParser:
             chunks.append(current_block)
 
         return chunks
-

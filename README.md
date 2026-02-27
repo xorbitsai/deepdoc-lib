@@ -72,6 +72,14 @@ pdf_model_cfg = PdfModelConfig.from_env()
 pdf_parser = PdfParser(model_cfg=pdf_model_cfg, tokenizer_cfg=tokenizer_cfg)
 ```
 
+Or rely on defaults (env + cache). Deepdoc will look for cached bundles under
+`$DEEPDOC_MODEL_HOME` (or `~/.cache/deepdoc`) and only download missing files
+when the provider allows remote access:
+
+```python
+pdf_parser = PdfParser()
+```
+
 env definitions:
 
 ```bash

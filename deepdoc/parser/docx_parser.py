@@ -25,7 +25,9 @@ from ..depend.rag_tokenizer import RagTokenizer
 
 
 class RAGFlowDocxParser:
-    def __init__(self, tokenizer_cfg: TokenizerConfig):
+    def __init__(self, tokenizer_cfg: TokenizerConfig | None = None):
+        if tokenizer_cfg is None:
+            tokenizer_cfg = TokenizerConfig.from_env()
         self.tokenizer_cfg = tokenizer_cfg
         self.tokenizer = RagTokenizer(
             dict_prefix=tokenizer_cfg.resolve_dict_prefix(),

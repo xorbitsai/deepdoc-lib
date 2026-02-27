@@ -117,3 +117,25 @@ class TestModelStoreSharedRepo(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["repo"], "OtherOrg/vision-only")
             self.assertEqual(Path(calls[0]["local_dir"]).resolve(), (Path(tmp) / "vision").resolve())
+
+    def test_auto_provider_discovers_pre_downloaded_shared_repo_without_downloading(self) -> None:
+        """If models were previously downloaded into the shared repo dir, 'auto' should reuse them."""
+
+        def snapshot_download(*args, **kwargs) -> str:  # pragma: no cover
+            raise AssertionError("snapshot_download should not be called when cached files already exist")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ[ms.GLOBAL_MODELSCOPE_REPO_ENV] = "Xorbits/deepdoc"
+            os.environ[ms.GLOBAL_MODELSCOPE_REVISION_ENV] = "v1"
+
+            expected_root = (Path(tmp) / "modelscope" / "Xorbits__deepdoc" / "v1").resolve()
+            _create_combined_repo_layout(expected_root)
+
+            with patch.object(ms, "_import_modelscope_snapshot_download", return_value=snapshot_download):
+                vision_dir = Path(ms.resolve_bundle_dir("vision", model_home=tmp, provider="auto", offline=False))
+                xgb_dir = Path(ms.resolve_bundle_dir("xgb", model_home=tmp, provider="auto", offline=False))
+                tok_dir = Path(ms.resolve_bundle_dir("tokenizer", model_home=tmp, provider="auto", offline=False))
+
+            self.assertEqual(vision_dir.resolve(), (expected_root / "vision").resolve())
+            self.assertEqual(xgb_dir.resolve(), (expected_root / "xgb").resolve())
+            self.assertEqual(tok_dir.resolve(), (expected_root / "tokenizer").resolve())
