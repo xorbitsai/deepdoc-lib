@@ -60,6 +60,9 @@ gpu = [
     "torch",
 ]
 
+[project.scripts]
+deepdoc-download-models = "deepdoc.download_models:main"
+
 [dependency-groups]
 test = [
     "openpyxl>=3.1.5",

@@ -98,6 +98,25 @@ export DEEPDOC_OFFLINE=0
 export DEEPDOC_NLTK_DATA_DIR=/path/to/nltk_data
 ```
 
+### Download model artifacts
+
+To pre-download all model bundles (vision/xgb/tokenizer) into the default cache directory (`~/.cache/deepdoc`), run:
+
+```bash
+deepdoc-download-models
+# or (from source checkout)
+python -m deepdoc.download_models
+```
+
+If you want to override the cache location, set `DEEPDOC_MODEL_HOME`:
+
+```bash
+export DEEPDOC_MODEL_HOME=./models
+deepdoc-download-models
+```
+
+By default this also downloads the required NLTK resources into `~/.cache/deepdoc/nltk_data` (or `$DEEPDOC_MODEL_HOME/nltk_data`).
+
 
 ### Vision Model Usage
 

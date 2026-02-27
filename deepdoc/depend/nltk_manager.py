@@ -38,10 +38,21 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
 
 
 def _resolve_nltk_data_dir(data_dir: str | None) -> Path | None:
-    configured = data_dir or os.getenv("DEEPDOC_NLTK_DATA_DIR")
-    if not configured:
-        return None
-    return Path(configured).expanduser().resolve()
+    # Resolution precedence:
+    # 1) explicit arg
+    # 2) DEEPDOC_NLTK_DATA_DIR
+    # 3) NLTK_DATA (common NLTK env var)
+    # 4) fall back to a stable Deepdoc cache location so parsers can pick it up automatically
+    configured = data_dir or os.getenv("DEEPDOC_NLTK_DATA_DIR") or os.getenv("NLTK_DATA")
+    if configured and configured.strip():
+        return Path(configured).expanduser().resolve()
+
+    model_home = os.getenv("DEEPDOC_MODEL_HOME")
+    if model_home and model_home.strip():
+        base = Path(model_home).expanduser().resolve()
+    else:
+        base = Path.home().joinpath(".cache", "deepdoc")
+    return base.joinpath("nltk_data")
 
 
 def _ensure_search_path(nltk_module, data_path: Path | None):
