@@ -23,9 +23,7 @@ from copy import deepcopy
 
 import cv2
 import numpy as np
-from huggingface_hub import snapshot_download
-
-from ..common.file_utils import get_project_base_directory
+from ..common.model_store import resolve_vision_model_dir
 from deepdoc.vision import Recognizer
 from deepdoc.vision.operators import nms
 
@@ -45,13 +43,21 @@ class LayoutRecognizer(Recognizer):
         "Equation",
     ]
 
-    def __init__(self, domain):
-        try:
-            model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
-            super().__init__(self.labels, domain, model_dir)
-        except Exception:
-            model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc", local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"), local_dir_use_symlinks=False)
-            super().__init__(self.labels, domain, model_dir)
+    def __init__(
+        self,
+        domain,
+        model_dir: str | None = None,
+        model_home: str | None = None,
+        model_provider: str | None = None,
+        offline: bool | None = None,
+    ):
+        if not model_dir:
+            model_dir = resolve_vision_model_dir(
+                model_home=model_home,
+                provider=model_provider,
+                offline=offline,
+            )
+        super().__init__(self.labels, domain, model_dir)
 
         self.garbage_layouts = ["footer", "header", "reference"]
         self.client = None
@@ -175,9 +181,22 @@ class LayoutRecognizer4YOLOv10(LayoutRecognizer):
         "Figure caption",
     ]
 
-    def __init__(self, domain):
+    def __init__(
+        self,
+        domain,
+        model_dir: str | None = None,
+        model_home: str | None = None,
+        model_provider: str | None = None,
+        offline: bool | None = None,
+    ):
         domain = "layout"
-        super().__init__(domain)
+        super().__init__(
+            domain,
+            model_dir=model_dir,
+            model_home=model_home,
+            model_provider=model_provider,
+            offline=offline,
+        )
         self.auto = False
         self.scaleFill = False
         self.scaleup = True
@@ -252,11 +271,16 @@ class AscendLayoutRecognizer(Recognizer):
         "Figure caption",
     ]
 
-    def __init__(self, domain):
+    def __init__(self, domain, model_dir: str | None = None):
         from ais_bench.infer.interface import InferSession
 
-        model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
-        model_file_path = os.path.join(model_dir, domain + ".om")
+        model_root = model_dir or os.getenv("DEEPDOC_ASCEND_MODEL_DIR")
+        if not model_root:
+            raise FileNotFoundError(
+                "Ascend layout recognizer requires DEEPDOC_ASCEND_MODEL_DIR or an explicit model_dir."
+            )
+
+        model_file_path = os.path.join(model_root, domain + ".om")
 
         if not os.path.exists(model_file_path):
             raise ValueError(f"Model file not found: {model_file_path}")

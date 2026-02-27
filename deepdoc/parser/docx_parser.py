@@ -18,11 +18,22 @@ from docx import Document
 import re
 import pandas as pd
 from collections import Counter
-from ..depend import rag_tokenizer
 from io import BytesIO
+
+from ..config import TokenizerConfig
+from ..depend.rag_tokenizer import RagTokenizer
 
 
 class RAGFlowDocxParser:
+    def __init__(self, tokenizer_cfg: TokenizerConfig | None = None):
+        if tokenizer_cfg is None:
+            tokenizer_cfg = TokenizerConfig.from_env()
+        self.tokenizer_cfg = tokenizer_cfg
+        self.tokenizer = RagTokenizer(
+            dict_prefix=tokenizer_cfg.resolve_dict_prefix(),
+            offline=tokenizer_cfg.offline,
+            nltk_data_dir=tokenizer_cfg.nltk_data_dir,
+        )
 
     def __extract_table_content(self, tb):
         df = []
@@ -50,14 +61,14 @@ class RAGFlowDocxParser:
             for p, n in pattern:
                 if re.search(p, b):
                     return n
-            tks = [t for t in rag_tokenizer.tokenize(b).split() if len(t) > 1]
+            tks = [t for t in self.tokenizer.tokenize(b).split() if len(t) > 1]
             if len(tks) > 3:
                 if len(tks) < 12:
                     return "Tx"
                 else:
                     return "Lx"
 
-            if len(tks) == 1 and rag_tokenizer.tag(tks[0]) == "nr":
+            if len(tks) == 1 and self.tokenizer.tag(tks[0]) == "nr":
                 return "Nr"
 
             return "Ot"

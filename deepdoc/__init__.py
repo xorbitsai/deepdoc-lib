@@ -19,6 +19,7 @@ beartype_this_package()
 
 from .parser import *
 from .depend.simple_cv_model import *
+from .config import PdfModelConfig, TokenizerConfig, ParserRuntimeConfig
 from .llm_adapter import LLMAdapter, LLMType, vision_llm_chunk
 
 __all__ = [
@@ -31,6 +32,9 @@ __all__ = [
     "JsonParser",
     "MarkdownParser",
     "TxtParser",
+    "TokenizerConfig",
+    "PdfModelConfig",
+    "ParserRuntimeConfig",
     # LLM Adapter exports
     "LLMAdapter",
     "LLMType",

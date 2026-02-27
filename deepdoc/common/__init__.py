@@ -11,6 +11,13 @@ from .misc_utils import pip_install_torch
 from .connection_utils import timeout
 from .config_utils import get_base_config, get_config_value
 from .settings import PARALLEL_DEVICES, check_and_install_torch
+from .model_store import (
+    resolve_bundle_dir,
+    resolve_tokenizer_dict_prefix,
+    resolve_vision_model_dir,
+    resolve_xgb_model_dir,
+    validate_bundle_dir,
+)
 
 __all__ = [
     # file_utils
@@ -35,4 +42,11 @@ __all__ = [
     # settings
     "PARALLEL_DEVICES",
     "check_and_install_torch",
+
+    # model_store
+    "resolve_bundle_dir",
+    "resolve_tokenizer_dict_prefix",
+    "resolve_vision_model_dir",
+    "resolve_xgb_model_dir",
+    "validate_bundle_dir",
 ]

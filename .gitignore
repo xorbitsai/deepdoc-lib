@@ -219,3 +219,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 .DS_Store
+
+# Tokenizer trie cache
+deepdoc/dict/*.trie

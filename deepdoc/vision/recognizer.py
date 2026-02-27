@@ -13,38 +13,35 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-import gc
 import logging
-import os
 import math
 import numpy as np
 import cv2
 from functools import cmp_to_key
 
 
-from ..common.file_utils import get_project_base_directory
+from ..common.model_store import resolve_vision_model_dir
 from .operators import *  # noqa: F403
 from .operators import preprocess
 from . import operators
 from .ocr import load_model
 
 class Recognizer:
-    def __init__(self, label_list, task_name, model_dir=None):
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
-
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
-
-        For Windows:
-        Good luck
-        ^_-
-
-        """
+    def __init__(
+        self,
+        label_list,
+        task_name,
+        model_dir=None,
+        model_home: str | None = None,
+        model_provider: str | None = None,
+        offline: bool | None = None,
+    ):
         if not model_dir:
-            model_dir = os.path.join(
-                        get_project_base_directory(),
-                        "rag/res/deepdoc")
+            model_dir = resolve_vision_model_dir(
+                model_home=model_home,
+                provider=model_provider,
+                offline=offline,
+            )
         self.ort_sess, self.run_options = load_model(model_dir, task_name)
         self.input_names = [node.name for node in self.ort_sess.get_inputs()]
         self.output_names = [node.name for node in self.ort_sess.get_outputs()]
@@ -407,10 +404,20 @@ class Recognizer:
         } for i in indices]
 
     def close(self):
-        logging.info("Close recognizer.")
+        # NOTE: `__del__` can run during interpreter shutdown when module
+        # globals (including `logging`/`gc`) may already be cleared to None.
+        try:
+            import logging as _logging
+            _logging.info("Close recognizer.")
+        except Exception:
+            pass
         if hasattr(self, "ort_sess"):
             del self.ort_sess
-        gc.collect()
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
 
     def __call__(self, image_list, thr=0.7, batch_size=16):
         res = []
@@ -437,6 +444,8 @@ class Recognizer:
         return res
 
     def __del__(self):
-        self.close()
-
-
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never raise.
+            pass

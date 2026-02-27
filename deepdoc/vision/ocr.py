@@ -13,15 +13,12 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-import gc
 import logging
 import copy
 import time
 import os
 
-from huggingface_hub import snapshot_download
-
-from ..common.file_utils import get_project_base_directory
+from ..common.model_store import resolve_vision_model_dir
 from ..common.misc_utils import pip_install_torch
 from ..common import settings
 from .operators import *  # noqa: F403
@@ -355,10 +352,20 @@ class TextRecognizer:
 
     def close(self):
         # close session and release manually
-        logging.info('Close text recognizer.')
+        # NOTE: `__del__` can run during interpreter shutdown when module
+        # globals (including `logging`/`gc`) may already be cleared to None.
+        try:
+            import logging as _logging
+            _logging.info("Close text recognizer.")
+        except Exception:
+            pass
         if hasattr(self, "predictor"):
             del self.predictor
-        gc.collect()
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
 
     def __call__(self, img_list):
         img_num = len(img_list)
@@ -408,7 +415,11 @@ class TextRecognizer:
         return rec_res, time.time() - st
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never raise.
+            pass
 
 
 class TextDetector:
@@ -495,10 +506,20 @@ class TextDetector:
         return dt_boxes
 
     def close(self):
-        logging.info("Close text detector.")
+        # NOTE: `__del__` can run during interpreter shutdown when module
+        # globals (including `logging`/`gc`) may already be cleared to None.
+        try:
+            import logging as _logging
+            _logging.info("Close text detector.")
+        except Exception:
+            pass
         if hasattr(self, "predictor"):
             del self.predictor
-        gc.collect()
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
 
     def __call__(self, img):
         ori_im = img.copy()
@@ -530,53 +551,38 @@ class TextDetector:
         return dt_boxes, time.time() - st
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            # Destructors must never raise.
+            pass
 
 
 class OCR:
-    def __init__(self, model_dir=None):
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
-
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
-
-        For Windows:
-        Good luck
-        ^_-
-
-        """
+    def __init__(
+        self,
+        model_dir=None,
+        model_home: str | None = None,
+        model_provider: str | None = None,
+        offline: bool | None = None,
+    ):
         if not model_dir:
-            try:
-                model_dir = os.path.join(
-                        get_project_base_directory(),
-                        "rag/res/deepdoc")
-                
-                # Append muti-gpus task to the list
-                if settings.PARALLEL_DEVICES > 0:
-                    self.text_detector = []
-                    self.text_recognizer = []
-                    for device_id in range(settings.PARALLEL_DEVICES):
-                        self.text_detector.append(TextDetector(model_dir, device_id))
-                        self.text_recognizer.append(TextRecognizer(model_dir, device_id))
-                else:
-                    self.text_detector = [TextDetector(model_dir)]
-                    self.text_recognizer = [TextRecognizer(model_dir)]
+            model_dir = resolve_vision_model_dir(
+                model_home=model_home,
+                provider=model_provider,
+                offline=offline,
+            )
 
-            except Exception:
-                model_dir = snapshot_download(repo_id="InfiniFlow/deepdoc",
-                                              local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
-                                              local_dir_use_symlinks=False)
-                
-                if settings.PARALLEL_DEVICES > 0:
-                    self.text_detector = []
-                    self.text_recognizer = []
-                    for device_id in range(settings.PARALLEL_DEVICES):
-                        self.text_detector.append(TextDetector(model_dir, device_id))
-                        self.text_recognizer.append(TextRecognizer(model_dir, device_id))
-                else:
-                    self.text_detector = [TextDetector(model_dir)]
-                    self.text_recognizer = [TextRecognizer(model_dir)]
+        # Append multi-GPU tasks to the list
+        if settings.PARALLEL_DEVICES > 0:
+            self.text_detector = []
+            self.text_recognizer = []
+            for device_id in range(settings.PARALLEL_DEVICES):
+                self.text_detector.append(TextDetector(model_dir, device_id))
+                self.text_recognizer.append(TextRecognizer(model_dir, device_id))
+        else:
+            self.text_detector = [TextDetector(model_dir)]
+            self.text_recognizer = [TextRecognizer(model_dir)]
 
         self.drop_score = 0.5
         self.crop_image_res_index = 0
