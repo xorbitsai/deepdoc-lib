@@ -33,5 +33,38 @@ jobs:
                   python -m build --wheel
                   python -m pip install --dry-run --ignore-installed dist/*.whl 'PyJWT[crypto]>=2.15.1,<3'
 
+            # Preprovision immutable official data instead of asking the NLTK
+            # downloader to traverse the runner's proxy. Do not disable pathsec.
+            - name: Check out pinned NLTK test resources
+              uses: actions/checkout@v4
+              with:
+                  repository: nltk/nltk_data
+                  ref: 550b6625bcef1f2abff2ff770a5a0d272c9c6b2a
+                  path: .ci-nltk-data
+                  persist-credentials: false
+                  sparse-checkout-cone-mode: false
+                  sparse-checkout: |
+                      packages/tokenizers/punkt.zip
+                      packages/tokenizers/punkt_tab.zip
+                      packages/corpora/wordnet.zip
+                      packages/taggers/averaged_perceptron_tagger.zip
+                      packages/taggers/averaged_perceptron_tagger_eng.zip
+
+            - name: Prepare and validate offline NLTK test resources
+              env:
+                  DEEPDOC_NLTK_DATA_DIR: ${{ runner.temp }}/deepdoc-nltk-data
+                  NLTK_DATA: ${{ runner.temp }}/deepdoc-nltk-data
+              run: |
+                  mkdir -p "$NLTK_DATA/tokenizers" "$NLTK_DATA/corpora" "$NLTK_DATA/taggers"
+                  python -m zipfile -e .ci-nltk-data/packages/tokenizers/punkt.zip "$NLTK_DATA/tokenizers"
+                  python -m zipfile -e .ci-nltk-data/packages/tokenizers/punkt_tab.zip "$NLTK_DATA/tokenizers"
+                  python -m zipfile -e .ci-nltk-data/packages/corpora/wordnet.zip "$NLTK_DATA/corpora"
+                  python -m zipfile -e .ci-nltk-data/packages/taggers/averaged_perceptron_tagger.zip "$NLTK_DATA/taggers"
+                  python -m zipfile -e .ci-nltk-data/packages/taggers/averaged_perceptron_tagger_eng.zip "$NLTK_DATA/taggers"
+                  python -c 'from deepdoc.depend.nltk_manager import ensure_nltk_data; ensure_nltk_data(offline=True)'
+
             - name: Run tests
+              env:
+                  DEEPDOC_NLTK_DATA_DIR: ${{ runner.temp }}/deepdoc-nltk-data
+                  NLTK_DATA: ${{ runner.temp }}/deepdoc-nltk-data
               run: python -m pytest tests

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 from pptx import Presentation
@@ -351,8 +352,10 @@ print("Hello World")
         """测试PDF解析器"""
         test_file = self.create_test_pdf_file("test.pdf")
 
-        parser = PdfParser()
         try:
+            # Model availability is checked during construction too; keep it
+            # inside this integration test's existing runtime-asset guard.
+            parser = PdfParser()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 text_content, tbls = parser(test_file, need_image=False)
@@ -368,6 +371,17 @@ print("Hello World")
         self.assertEqual(parser.total_page, 1)
 
         print(f"✅ PDF解析成功: {len(text_content)} 个文本字符, {len(tbls)} 个表格/图片块")
+
+    def test_pdf_initializer_respects_asset_failure_policy(self):
+        cases = (
+            (FileNotFoundError("Missing model assets"), unittest.SkipTest),
+            (RuntimeError("unexpected constructor defect"), RuntimeError),
+        )
+        for error, expected in cases:
+            with self.subTest(error=error):
+                with patch(f"{__name__}.PdfParser", side_effect=error):
+                    with self.assertRaises(expected):
+                        self.test_pdf_parser()
 
     @unittest.skip("需要真实的图片文件")
     def test_figure_parser(self):
