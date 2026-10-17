@@ -11,7 +11,7 @@ import requests
 from openai import OpenAI
 from openai.lib.azure import AzureOpenAI
 from PIL import Image
-from zhipuai import ZhipuAI
+from zai import ZhipuAiClient
 
 # 可选导入 ollama
 try:
@@ -162,7 +162,12 @@ class Zhipu4V(Base):
 
     def __init__(self, key, model_name="glm-4v", lang="Chinese", **kwargs):
         super().__init__(key, model_name, lang)
-        self.client = ZhipuAI(api_key=key)
+        # Preserve the legacy override and China default instead of allowing
+        # the maintained SDK's ZAI_BASE_URL to redirect this provider adapter.
+        self.client = ZhipuAiClient(
+            api_key=key,
+            base_url=kwargs.get("base_url") or os.getenv("ZHIPUAI_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4/",
+        )
 
     def describe_with_prompt(self, image, prompt=None):
         """使用智谱AI视觉模型描述图片"""
