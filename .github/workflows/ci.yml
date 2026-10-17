@@ -55,12 +55,10 @@ jobs:
                   DEEPDOC_NLTK_DATA_DIR: ${{ runner.temp }}/deepdoc-nltk-data
                   NLTK_DATA: ${{ runner.temp }}/deepdoc-nltk-data
               run: |
-                  mkdir -p "$NLTK_DATA/tokenizers" "$NLTK_DATA/corpora" "$NLTK_DATA/taggers"
-                  python -m zipfile -e .ci-nltk-data/packages/tokenizers/punkt.zip "$NLTK_DATA/tokenizers"
-                  python -m zipfile -e .ci-nltk-data/packages/tokenizers/punkt_tab.zip "$NLTK_DATA/tokenizers"
-                  python -m zipfile -e .ci-nltk-data/packages/corpora/wordnet.zip "$NLTK_DATA/corpora"
-                  python -m zipfile -e .ci-nltk-data/packages/taggers/averaged_perceptron_tagger.zip "$NLTK_DATA/taggers"
-                  python -m zipfile -e .ci-nltk-data/packages/taggers/averaged_perceptron_tagger_eng.zip "$NLTK_DATA/taggers"
+                  for package in tokenizers/punkt tokenizers/punkt_tab corpora/wordnet \
+                      taggers/averaged_perceptron_tagger taggers/averaged_perceptron_tagger_eng; do
+                      python -m zipfile -e ".ci-nltk-data/packages/$package.zip" "$NLTK_DATA/$(dirname "$package")"
+                  done
                   python -c 'from deepdoc.depend.nltk_manager import ensure_nltk_data; ensure_nltk_data(offline=True)'
 
             - name: Run tests
@@ -68,3 +66,27 @@ jobs:
                   DEEPDOC_NLTK_DATA_DIR: ${{ runner.temp }}/deepdoc-nltk-data
                   NLTK_DATA: ${{ runner.temp }}/deepdoc-nltk-data
               run: python -m pytest tests
+
+    minimum-sdk:
+        name: Minimum SDK contract (3.10)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.10"
+                  cache: "pip"
+
+            - name: Build and resolve the wheel with the minimum SDK and current PyJWT
+              run: |
+                  python -m pip install --upgrade pip build
+                  python -m build --wheel
+                  python -m pip install --dry-run --ignore-installed dist/*.whl 'zai-sdk==0.0.4' 'PyJWT[crypto]>=2.15.1,<3'
+
+            - name: Install and test the minimum SDK contract
+              run: |
+                  python -m pip install dist/*.whl 'zai-sdk==0.0.4' 'PyJWT[crypto]>=2.15.1,<3' pytest
+                  python -m pip check
+                  python -m pytest tests/test_zhipu_sdk_compatibility.py

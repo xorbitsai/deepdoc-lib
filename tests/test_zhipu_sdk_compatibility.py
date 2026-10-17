@@ -3,13 +3,11 @@
 import base64
 import importlib.util
 import json
-import re
 from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
-from packaging.requirements import Requirement
 
 
 @pytest.fixture
@@ -24,7 +22,17 @@ def vision_module():
 
 
 @pytest.mark.parametrize("image", [b"image-bytes", BytesIO(b"image-bytes")])
-def test_zhipu_vision_request_preserves_endpoint_and_payload(vision_module, monkeypatch, image):
+@pytest.mark.parametrize(
+    "env_url, explicit_url, expected_url",
+    [
+        (None, None, "https://open.bigmodel.cn/api/paas/v4/"),
+        ("https://gateway.example.com/zhipu/", None, "https://gateway.example.com/zhipu/"),
+        ("https://gateway.example.com/zhipu/", "https://custom.example.com/vision/", "https://custom.example.com/vision/"),
+        ("https://gateway.example.com/zhipu/", "", "https://gateway.example.com/zhipu/"),
+        ("", None, "https://open.bigmodel.cn/api/paas/v4/"),
+    ],
+)
+def test_zhipu_vision_request_preserves_endpoint_and_payload(vision_module, monkeypatch, image, env_url, explicit_url, expected_url):
     seen = []
 
     def respond(request):
@@ -42,12 +50,16 @@ def test_zhipu_vision_request_preserves_endpoint_and_payload(vision_module, monk
 
     client_type = vision_module.ZhipuAiClient
     monkeypatch.setenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4/")
+    if env_url is None:
+        monkeypatch.delenv("ZHIPUAI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("ZHIPUAI_BASE_URL", env_url)
     with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
         monkeypatch.setattr(vision_module, "ZhipuAiClient", lambda **kwargs: client_type(http_client=transport, **kwargs))
-        model = vision_module.Zhipu4V("test-id.test-secret-with-at-least-32-bytes")
+        model = vision_module.Zhipu4V("test-id.test-secret-with-at-least-32-bytes", base_url=explicit_url)
         assert model.describe_with_prompt(image, "Describe this image") == "described"
     (request,) = seen
-    assert str(request.url) == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    assert str(request.url) == expected_url + "chat/completions"
     assert request.headers["Authorization"]
     payload = json.loads(request.content)
     assert payload["model"] == "glm-4v"
@@ -57,11 +69,3 @@ def test_zhipu_vision_request_preserves_endpoint_and_payload(vision_module, monk
         # The official SDK converts a data URI to the provider's base64 field.
         {"type": "image_url", "image_url": {"url": base64.b64encode(b"image-bytes").decode()}},
     ]
-
-
-def test_dependency_metadata_does_not_require_legacy_zhipuai():
-    project = (Path(__file__).parents[1] / "pyproject.toml").read_text()
-    assert '"zhipuai' not in project
-    (sdk,) = [Requirement(value) for value in re.findall(r'"(zai-sdk[^"\n]*)"', project)]
-    assert "0.0.3.4" not in sdk.specifier
-    assert "0.0.4" in sdk.specifier

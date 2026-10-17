@@ -162,9 +162,11 @@ class Zhipu4V(Base):
 
     def __init__(self, key, model_name="glm-4v", lang="Chinese", **kwargs):
         super().__init__(key, model_name, lang)
-        # Keep the existing China endpoint; ZaiClient targets api.z.ai instead.
+        # Preserve the legacy override and China default instead of allowing
+        # the maintained SDK's ZAI_BASE_URL to redirect this provider adapter.
         self.client = ZhipuAiClient(
-            api_key=key, base_url="https://open.bigmodel.cn/api/paas/v4/"
+            api_key=key,
+            base_url=kwargs.get("base_url") or os.getenv("ZHIPUAI_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4/",
         )
 
     def describe_with_prompt(self, image, prompt=None):
