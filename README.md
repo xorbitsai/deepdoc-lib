@@ -14,6 +14,12 @@ GPU (Linux x86_64 only):
 pip install deepdoc-lib[gpu]
 ```
 
+Gemini vision provider (optional, installs the `google-genai` SDK):
+
+```bash
+pip install deepdoc-lib[gemini]
+```
+
 Note: `onnxruntime` (CPU) and `onnxruntime-gpu` should not be installed together. If you're switching an existing environment to GPU, uninstall CPU ORT first:
 
 ```bash
@@ -167,6 +173,8 @@ vision_model = create_vision_model("qwen")
 ```
 
 Supported providers: ["openai", "qwen", "zhipu", "ollama", "gemini", "anthropic"]
+
+The `gemini` provider needs the `gemini` extra: `pip install deepdoc-lib[gemini]`.
 
 - Use Configuration File
 

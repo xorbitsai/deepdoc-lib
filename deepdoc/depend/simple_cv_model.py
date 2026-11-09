@@ -306,9 +306,16 @@ class GeminiCV(Base):
 
     def __init__(self, key, model_name="gemini-pro-vision", lang="Chinese", **kwargs):
         super().__init__(key, model_name, lang)
-        import google.generativeai as genai
-        genai.configure(api_key=key)
-        self.model = genai.GenerativeModel(model_name)
+        # The legacy google-generativeai SDK caps protobuf below 6, so Gemini
+        # uses the maintained google-genai SDK as an optional extra instead.
+        try:
+            from google import genai
+        except ImportError as e:
+            raise ImportError(
+                "Gemini vision requires the google-genai package. "
+                "Install it with: pip install 'deepdoc-lib[gemini]'"
+            ) from e
+        self.client = genai.Client(api_key=key)
 
     def describe_with_prompt(self, image, prompt=None):
         """使用Google Gemini模型描述图片"""
@@ -323,11 +330,19 @@ class GeminiCV(Base):
             
             pil_image = Image.open(BytesIO(img_data))
             
-            response = self.model.generate_content([
-                prompt or self.prompt(image),
-                pil_image
-            ])
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[prompt or self.prompt(image), pil_image],
+            )
 
+            # google-genai returns None (the legacy SDK raised) when the
+            # response has no text, e.g. a safety block; keep the error path.
+            # A block can be reported on the prompt or on the candidate.
+            if response.text is None:
+                candidates = response.candidates or []
+                finish_reason = candidates[0].finish_reason if candidates else None
+                finish_reason = getattr(finish_reason, "name", finish_reason)
+                raise ValueError(f"Gemini returned no text (finish_reason={finish_reason}, prompt_feedback={response.prompt_feedback})")
             return response.text.strip()
         except Exception as e:
             return "**ERROR**: " + str(e)
