@@ -104,14 +104,25 @@ def test_gemini_uses_default_prompt(vision_module, fake_genai):
     assert call["contents"][0] == "Please describe this image in detail."
 
 
-def test_gemini_empty_response_keeps_error_contract(vision_module, fake_genai):
-    fake_genai.models.response = types.SimpleNamespace(text=None, prompt_feedback="block_reason=SAFETY")
+@pytest.mark.parametrize(
+    "candidates, prompt_feedback, expected",
+    [
+        # Blocked prompt: no candidates, reason on prompt_feedback.
+        ([], "block_reason=SAFETY", ["finish_reason=None", "prompt_feedback=block_reason=SAFETY"]),
+        (None, "block_reason=SAFETY", ["finish_reason=None", "prompt_feedback=block_reason=SAFETY"]),
+        # Blocked candidate: reason only on the candidate's finish_reason.
+        ([types.SimpleNamespace(finish_reason=types.SimpleNamespace(name="SAFETY"))], None, ["finish_reason=SAFETY", "prompt_feedback=None"]),
+    ],
+)
+def test_gemini_empty_response_keeps_error_contract(vision_module, fake_genai, candidates, prompt_feedback, expected):
+    fake_genai.models.response = types.SimpleNamespace(text=None, candidates=candidates, prompt_feedback=prompt_feedback)
     model = vision_module.GeminiCV("test-key")
 
     result = model.describe_with_prompt(_png_bytes(), "Describe")
 
-    assert result.startswith("**ERROR**: ")
-    assert "SAFETY" in result
+    assert result.startswith("**ERROR**: Gemini returned no text")
+    for fragment in expected:
+        assert fragment in result
 
 
 @pytest.mark.parametrize("image, expected", [(_png_bytes(), "boom"), ("not-bytes", "image must be BytesIO or bytes")])
@@ -137,15 +148,16 @@ def test_gemini_missing_sdk_names_the_extra(vision_module, monkeypatch):
         vision_module.GeminiCV("test-key")
 
 
-def test_real_google_genai_request_carries_prompt_and_image(vision_module, monkeypatch):
-    """Exercise the installed SDK end to end against a loopback server (no network)."""
+@pytest.fixture
+def gemini_server(monkeypatch):
+    """Point the installed SDK at a loopback server (no network) and record requests."""
     genai = pytest.importorskip("google.genai")
-    seen = []
+    state = types.SimpleNamespace(seen=[], response={})
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
-            seen.append((self.path, dict(self.headers), json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
-            body = json.dumps({"candidates": [{"content": {"role": "model", "parts": [{"text": " described "}]}, "finishReason": "STOP"}]}).encode()
+            state.seen.append((self.path, dict(self.headers), json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+            body = json.dumps(state.response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -164,13 +176,19 @@ def test_real_google_genai_request_carries_prompt_and_image(vision_module, monke
     base_url = f"http://127.0.0.1:{server.server_port}/"
     monkeypatch.setattr(genai, "Client", lambda **kwargs: real_client(http_options={"base_url": base_url}, **kwargs))
     try:
-        model = vision_module.GeminiCV("test-key", "gemini-2.5-flash")
-        assert model.describe_with_prompt(_png_bytes(), "Describe this image") == "described"
+        yield state
     finally:
         server.shutdown()
         server.server_close()
 
-    ((path, headers, payload),) = seen
+
+def test_real_google_genai_request_carries_prompt_and_image(vision_module, gemini_server):
+    gemini_server.response = {"candidates": [{"content": {"role": "model", "parts": [{"text": " described "}]}, "finishReason": "STOP"}]}
+    model = vision_module.GeminiCV("test-key", "gemini-2.5-flash")
+
+    assert model.describe_with_prompt(_png_bytes(), "Describe this image") == "described"
+
+    ((path, headers, payload),) = gemini_server.seen
     assert path.endswith("/models/gemini-2.5-flash:generateContent")
     assert {k.lower(): v for k, v in headers.items()}["x-goog-api-key"] == "test-key"
     # Older SDKs send one user turn per list item, newer ones merge them.
@@ -180,3 +198,21 @@ def test_real_google_genai_request_carries_prompt_and_image(vision_module, monke
     image = image_part.get("inlineData") or image_part["inline_data"]
     assert (image.get("mimeType") or image["mime_type"]).startswith("image/")
     assert Image.open(BytesIO(base64.b64decode(image["data"]))).size == (2, 3)
+
+
+@pytest.mark.parametrize(
+    "response, expected",
+    [
+        ({"candidates": [{"finishReason": "SAFETY"}]}, "finish_reason=SAFETY"),
+        ({"promptFeedback": {"blockReason": "SAFETY"}}, "SAFETY"),
+        ({"candidates": []}, "finish_reason=None"),
+    ],
+)
+def test_real_google_genai_blocked_response_reports_reason(vision_module, gemini_server, response, expected):
+    gemini_server.response = response
+    model = vision_module.GeminiCV("test-key", "gemini-2.5-flash")
+
+    result = model.describe_with_prompt(_png_bytes(), "Describe this image")
+
+    assert result.startswith("**ERROR**: Gemini returned no text")
+    assert expected in result

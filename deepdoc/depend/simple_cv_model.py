@@ -337,8 +337,12 @@ class GeminiCV(Base):
 
             # google-genai returns None (the legacy SDK raised) when the
             # response has no text, e.g. a safety block; keep the error path.
+            # A block can be reported on the prompt or on the candidate.
             if response.text is None:
-                raise ValueError(f"Gemini returned no text (prompt_feedback={response.prompt_feedback})")
+                candidates = response.candidates or []
+                finish_reason = candidates[0].finish_reason if candidates else None
+                finish_reason = getattr(finish_reason, "name", finish_reason)
+                raise ValueError(f"Gemini returned no text (finish_reason={finish_reason}, prompt_feedback={response.prompt_feedback})")
             return response.text.strip()
         except Exception as e:
             return "**ERROR**: " + str(e)
